@@ -208,6 +208,11 @@ func (gw *Gateway) handleMessage(rmsg *config.Message, dest *bridge.Bridge) []*B
 		return brMsgIDs
 	}
 
+	channels := gw.getDestChannel(rmsg, *dest)
+	if len(channels) == 0 {
+		return brMsgIDs
+	}
+
 	// Get the ID of the parent message in thread
 	var canonicalParentMsgID string
 	if rmsg.ParentID != "" && dest.GetBool("PreserveThreading") {
@@ -219,7 +224,6 @@ func (gw *Gateway) handleMessage(rmsg *config.Message, dest *bridge.Bridge) []*B
 		canonicalThreadMsgID = gw.FindCanonicalMsgID(rmsg.Protocol, rmsg.ThreadID)
 	}
 
-	channels := gw.getDestChannel(rmsg, *dest)
 	for idx := range channels {
 		channel := &channels[idx]
 		msgID, err := gw.SendMessage(rmsg, dest, channel, canonicalParentMsgID, canonicalThreadMsgID)

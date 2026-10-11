@@ -1,60 +1,287 @@
 package matterclient
 
 import (
-	"github.com/mattermost/mattermost-server/v6/model"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/mattermost/mattermost/server/public/model"
 )
 
-func (m *Client) GetNickName(userID string) string {
-	if user := m.GetUser(userID); user != nil {
+// GetCachedUser returns the user from local cache without triggering a REST API lookup.
+func (m *Client) GetCachedUser(userID string) *model.User {
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
+
+	return m.Users.users[userID]
+}
+
+// GetCachedUserName returns the cached username if available, or empty string.
+func (m *Client) GetCachedUserName(userID string) string {
+	if u := m.GetCachedUser(userID); u != nil {
+		return u.Username
+	}
+
+	return ""
+}
+
+func (m *Client) GetNickName(ctx context.Context, userID string) string {
+	if user := m.GetUser(ctx, userID); user != nil {
 		return user.Nickname
 	}
 
 	return ""
 }
 
-func (m *Client) GetStatus(userID string) string {
-	res, _, err := m.Client.GetUserStatus(userID, "")
-	if err != nil {
-		return ""
+func (m *Client) GetStatus(ctx context.Context, userID string) string {
+	const (
+		activeThreshold  = 20 * time.Minute
+		offlineThreshold = 2 * time.Hour
+		statusTTL        = 5 * time.Minute
+	)
+
+	m.Users.mu.RLock()
+	lastActive := m.Users.lastUserActivity[userID]
+	status, ok := m.Users.statuses[userID]
+	lastFetched := m.Users.statusLastUpdated[userID]
+	customStatus, tracked := m.Users.customStatuses[userID]
+	customExpiresAt := m.Users.customStatusExpiresAt[userID]
+	m.Users.mu.RUnlock()
+
+	if customStatus != "" && customExpiresAt > 0 && time.Now().Unix() >= customExpiresAt {
+		m.Users.mu.Lock()
+
+		customStatus = m.Users.customStatuses[userID]
+		customExpiresAt = m.Users.customStatusExpiresAt[userID]
+
+		if customStatus != "" && customExpiresAt > 0 && time.Now().Unix() >= customExpiresAt {
+			m.Users.customStatuses[userID] = ""
+			delete(m.Users.customStatusExpiresAt, userID)
+
+			customStatus = ""
+		}
+
+		m.Users.mu.Unlock()
 	}
 
-	if res.Status == model.StatusAway {
-		return "away"
+	// Only let recent activity override if the user is marked offline or not yet tracked;
+	// never override explicit server states like "away", "dnd", or "ooo" (OutOfOffice).
+	if (status == model.StatusOffline || !ok) && lastActive > 0 && time.Since(time.Unix(lastActive, 0)) < activeThreshold {
+		return model.StatusOnline
 	}
 
-	if res.Status == model.StatusOnline {
-		return "online"
+	userName := m.GetCachedUserName(userID)
+	isStale := !ok || lastFetched == 0 || time.Since(time.Unix(lastFetched, 0)) > statusTTL
+
+	if isStale {
+		retryCount := 0
+		for {
+			m.apiLogger.Warnf("GetStatus: GetUserStatus: User: %s (%s) #%d", userName, userID, retryCount)
+
+			res, resp, err := m.Client.GetUserStatus(ctx, userID, "")
+			if err == nil {
+				status = m.SetUserStatus(userID, res.Status, false, res.LastActivityAt/1000)
+
+				break
+			}
+
+			shouldRetry, hErr := m.HandleRetry(ctx, "GetUserStatus", err, retryCount, 10, resp)
+			if hErr == nil && shouldRetry {
+				retryCount++
+
+				continue
+			}
+
+			// Fallback to existing cached status if HTTP API fails completely
+			m.Users.mu.Lock()
+			if m.Users.statusLastUpdated == nil {
+				m.Users.statusLastUpdated = make(map[string]int64, 1000)
+			}
+
+			m.Users.statusLastUpdated[userID] = time.Now().Unix()
+
+			status = m.Users.statuses[userID]
+			if status == "" {
+				status = model.StatusOffline
+				m.Users.statuses[userID] = status
+			}
+
+			m.Users.mu.Unlock()
+
+			break
+		}
+
+		m.Users.mu.RLock()
+		lastActive = m.Users.lastUserActivity[userID]
+		m.Users.mu.RUnlock()
 	}
 
-	return "offline"
+	// Downgrade zombie online sessions with no activity for > offlineThreshold to offline
+	if status == model.StatusOnline && lastActive > 0 && time.Since(time.Unix(lastActive, 0)) > offlineThreshold {
+		status = model.StatusOffline
+	}
+
+	if status == model.StatusOnline {
+		return status
+	}
+
+	if !tracked {
+		user := m.GetUser(ctx, userID)
+
+		var rawJSON string
+		if user != nil && user.Props != nil {
+			if val, propOk := user.Props["customStatus"]; propOk {
+				rawJSON = val
+			}
+		}
+
+		var tzLoc *time.Location
+		if m.User != nil {
+			tzLoc = m.User.GetTimezoneLocation()
+		}
+
+		// Parse & store in cache (permanently marks user as tracked)
+		m.Users.SetUserCustomStatus(userID, rawJSON, tzLoc)
+
+		m.Users.mu.RLock()
+		customStatus = m.Users.customStatuses[userID]
+		m.Users.mu.RUnlock()
+	}
+
+	if customStatus != "" {
+		if status != model.StatusOnline && status != "" {
+			return status + ": " + customStatus
+		}
+
+		return customStatus
+	}
+
+	return status
 }
 
-func (m *Client) GetStatuses() map[string]string {
-	var ids []string
+func (m *Client) GetStatuses(ctx context.Context) map[string]string {
+	const (
+		activeThreshold  = 20 * time.Minute
+		offlineThreshold = 2 * time.Hour
+	)
 
-	statuses := make(map[string]string)
+	now := time.Now()
 
-	for id := range m.Users {
-		ids = append(ids, id)
+	m.Users.mu.RLock()
+	statuses := make(map[string]string, len(m.Users.users))
+	var missingIDs []string
+
+	for id := range m.Users.users {
+		status, ok := m.Users.statuses[id]
+		lastActive := m.Users.lastUserActivity[id]
+
+		if ok && status == model.StatusOnline && lastActive > 0 && now.Sub(time.Unix(lastActive, 0)) > offlineThreshold {
+			statuses[id] = model.StatusOffline
+
+			continue
+		}
+
+		if ok && status != model.StatusOffline {
+			statuses[id] = status
+
+			continue
+		}
+
+		if lastActive > 0 && now.Sub(time.Unix(lastActive, 0)) < activeThreshold {
+			statuses[id] = model.StatusOnline
+
+			continue
+		}
+
+		if ok {
+			statuses[id] = status
+		} else {
+			missingIDs = append(missingIDs, id)
+		}
 	}
+	m.Users.mu.RUnlock()
 
-	res, _, err := m.Client.GetUsersStatusesByIds(ids)
-	if err != nil {
+	if len(missingIDs) == 0 {
 		return statuses
 	}
 
-	for _, status := range res {
-		statuses[status.UserId] = "offline"
-		if status.Status == model.StatusAway {
-			statuses[status.UserId] = "away"
-		}
+	const batchSize = 5000
 
-		if status.Status == model.StatusOnline {
-			statuses[status.UserId] = "online"
+	for i := 0; i < len(missingIDs); i += batchSize {
+		end := min(i+batchSize, len(missingIDs))
+		batch := missingIDs[i:end]
+
+		retryCount := 0
+		for {
+			if len(batch) <= 8 {
+				m.apiLogger.Warnf("GetStatuses: GetUsersStatusesByIds: Batch: %d %v #%d", len(batch), batch, retryCount)
+			} else {
+				m.apiLogger.Warnf("GetStatuses: GetUsersStatusesByIds: Batch: %d #%d", len(batch), retryCount)
+			}
+
+			res, resp, err := m.Client.GetUsersStatusesByIds(ctx, batch)
+			if err == nil {
+				m.Users.mu.Lock()
+				for _, st := range res {
+					cleanID := strings.Clone(st.UserId)
+					statuses[cleanID] = m.SetUserStatus(cleanID, st.Status, true, st.LastActivityAt/1000)
+				}
+				m.Users.mu.Unlock()
+
+				break // Break the retry loop on success to move to the next batch
+			}
+
+			shouldRetry, hErr := m.HandleRetry(ctx, "GetUsersStatusesByIds", err, retryCount, 10, resp)
+			if hErr == nil && shouldRetry {
+				retryCount++
+
+				continue
+			}
+
+			// If it completely fails after retries, break the loop and continue to the next batch
+			m.logger.Errorf("GetStatuses failed for batch starting at index %d: %v", i, err)
+
+			break
 		}
 	}
 
+	m.Users.mu.Lock()
+	for _, id := range missingIDs {
+		if _, ok := statuses[id]; !ok {
+			statuses[id] = m.SetUserStatus(id, model.StatusOffline, true, 0)
+		}
+	}
+	m.Users.mu.Unlock()
+
 	return statuses
+}
+
+func (m *Client) GetTeamByName(ctx context.Context, name string) (*model.Team, error) {
+	retryCount := 0
+	for {
+		m.apiLogger.Warnf("GetTeamByName: TeamName: %s #%d", name, retryCount)
+
+		team, resp, err := m.Client.GetTeamByName(ctx, name, "")
+		if err == nil {
+			return team, nil
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "GetTeamByName", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+
+			continue
+		}
+
+		m.logger.Errorf("GetTeamByName failed for %s: %v", name, err)
+
+		return nil, err
+	}
 }
 
 func (m *Client) GetTeamID() string {
@@ -62,7 +289,7 @@ func (m *Client) GetTeamID() string {
 }
 
 // GetTeamName returns the name of the specified teamId
-func (m *Client) GetTeamName(teamID string) string {
+func (m *Client) GetTeamName(ctx context.Context, teamID string) string {
 	m.RLock()
 	defer m.RUnlock()
 
@@ -75,25 +302,199 @@ func (m *Client) GetTeamName(teamID string) string {
 	return ""
 }
 
-func (m *Client) GetUser(userID string) *model.User {
-	m.Lock()
-	defer m.Unlock()
-
-	_, ok := m.Users[userID]
-	if !ok {
-		res, _, err := m.Client.GetUser(userID, "")
-		if err != nil {
-			return nil
-		}
-
-		m.Users[userID] = res
-	}
-
-	return m.Users[userID]
+// GetUser for backwards compatibility
+func (m *Client) GetUser(ctx context.Context, userID string) *model.User {
+	return m.GetUserByUserID(ctx, userID)
 }
 
-func (m *Client) GetUserName(userID string) string {
-	if user := m.GetUser(userID); user != nil {
+func (m *Client) GetUserByUserID(ctx context.Context, userID string) *model.User {
+	m.Users.mu.RLock()
+	user, exists := m.Users.users[userID]
+	m.Users.mu.RUnlock()
+
+	if exists {
+		return user
+	}
+
+	var mmuser *model.User
+
+	retryCount := 0
+	for {
+		m.apiLogger.Warnf("GetUser: UserID: %s #%d", userID, retryCount)
+
+		res, resp, err := m.Client.GetUser(ctx, userID, "")
+		if err == nil {
+			mmuser = res
+			break
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "GetUser", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+			continue
+		}
+
+		m.logger.Debugf("GetUser failed to fetch missing user %s: %s", userID, err)
+		return nil
+	}
+
+	mmuser.Id = strings.Clone(mmuser.Id)
+	mmuser.Username = strings.Clone(mmuser.Username)
+	mmuser.FirstName = strings.Clone(mmuser.FirstName)
+	mmuser.LastName = strings.Clone(mmuser.LastName)
+	mmuser.Nickname = strings.Clone(mmuser.Nickname)
+	mmuser.Roles = strings.Clone(mmuser.Roles)
+
+	m.UpdateUser(mmuser)
+
+	return mmuser
+}
+
+func (m *Client) GetUserByUsername(ctx context.Context, username string) *model.User {
+	m.Users.mu.RLock()
+
+	// Fast path: check if caller passed an already-cached User ID
+	if u, ok := m.Users.users[username]; ok {
+		m.Users.mu.RUnlock()
+		return u
+	}
+
+	// Scan cached users by username
+	for _, u := range m.Users.users {
+		if u.Username == username {
+			m.Users.mu.RUnlock()
+			return u
+		}
+	}
+
+	m.Users.mu.RUnlock()
+
+	var mmuser *model.User
+
+	// Query API by Username (handles genuine 26-character usernames)
+	retryCount := 0
+	for {
+		m.apiLogger.Warnf("GetUserByUsername: User: %s #%d", username, retryCount)
+
+		res, resp, err := m.Client.GetUserByUsername(ctx, username, "")
+		if err == nil {
+			mmuser = res
+			break
+		}
+
+		// If user not found and the string looks like an ID, cascade to GetUser
+		if resp != nil && resp.StatusCode == http.StatusNotFound && model.IsValidId(username) {
+			m.logger.Debugf("GetUserByUsername: %s not found as username, attempting lookup by User ID", username)
+			return m.GetUser(ctx, username)
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "GetUserByUsername", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+			continue
+		}
+
+		// Fallback attempt by ID if error was not retryable
+		if model.IsValidId(username) {
+			return m.GetUser(ctx, username)
+		}
+
+		m.logger.Debugf("GetUserByUsername failed to fetch missing user %s: %v", username, err)
+
+		return nil
+	}
+
+	mmuser.Id = strings.Clone(mmuser.Id)
+	mmuser.Username = strings.Clone(mmuser.Username)
+	mmuser.FirstName = strings.Clone(mmuser.FirstName)
+	mmuser.LastName = strings.Clone(mmuser.LastName)
+	mmuser.Nickname = strings.Clone(mmuser.Nickname)
+	mmuser.Roles = strings.Clone(mmuser.Roles)
+
+	m.UpdateUser(mmuser)
+
+	return mmuser
+}
+
+func (m *Client) GetUserChannels(ctx context.Context, userID string) ([]*model.Channel, error) {
+	if m.Team == nil || userID == "" {
+		return nil, nil
+	}
+
+	userName := m.GetCachedUserName(userID)
+	retryCount := 0
+
+	for {
+		m.apiLogger.Warnf("GetUserChannels: GetChannelsForTeamForUser: User: %s (%s) #%d", userName, userID, retryCount)
+
+		channels, resp, err := m.Client.GetChannelsForTeamForUser(ctx, m.Team.ID, userID, false, "")
+		if err == nil {
+			return channels, nil
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "GetUserChannels", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+
+			continue
+		}
+
+		m.logger.Debugf("GetUserChannels failed for %s (%s): %s", userName, userID, err)
+
+		return nil, err
+	}
+}
+
+// GetUserCount returns the total number of cached team users.
+func (m *Client) GetUserCount() int {
+	if m == nil || m.Users == nil {
+		return 0
+	}
+
+	m.Users.mu.RLock()
+	n := len(m.Users.users)
+	m.Users.mu.RUnlock()
+
+	return n
+}
+
+func (c *UsersCache) GetUserCustomStatus(userID string) string {
+	c.mu.RLock()
+	customStatus := c.customStatuses[userID]
+	customExpiresAt := c.customStatusExpiresAt[userID]
+	c.mu.RUnlock()
+
+	if customStatus != "" && customExpiresAt > 0 && time.Now().Unix() >= customExpiresAt {
+		c.mu.Lock()
+
+		customStatus = c.customStatuses[userID]
+		customExpiresAt = c.customStatusExpiresAt[userID]
+
+		if customStatus != "" && customExpiresAt > 0 && time.Now().Unix() >= customExpiresAt {
+			c.customStatuses[userID] = ""
+			delete(c.customStatusExpiresAt, userID)
+
+			c.mu.Unlock()
+
+			return ""
+		}
+
+		c.mu.Unlock()
+	}
+
+	return customStatus
+}
+
+// GetUserLastActivity returns the unix timestamp (in seconds) of the user's last activity.
+func (m *Client) GetUserLastActivity(userID string) int64 {
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
+
+	return m.Users.lastUserActivity[userID]
+}
+
+func (m *Client) GetUserName(ctx context.Context, userID string) string {
+	if user := m.GetUser(ctx, userID); user != nil {
 		return user.Username
 	}
 
@@ -101,112 +502,537 @@ func (m *Client) GetUserName(userID string) string {
 }
 
 func (m *Client) GetUsers() map[string]*model.User {
-	users := make(map[string]*model.User)
+	users := make(map[string]*model.User, len(m.Users.users))
 
-	m.RLock()
-	defer m.RUnlock()
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
 
-	for k, v := range m.Users {
+	for k, v := range m.Users.users {
 		users[k] = v
 	}
 
 	return users
 }
 
-func (m *Client) UpdateUsers() error {
-	idx := 0
-	max := 200
+func (c *UsersCache) RecordUserActivity(userID string) {
+	if userID == "" {
+		return
+	}
 
-	var (
-		mmusers []*model.User
-		resp    *model.Response
-		err     error
-	)
+	c.mu.Lock()
+	if c.lastUserActivity == nil {
+		c.lastUserActivity = make(map[string]int64, 1000)
+	}
 
+	c.lastUserActivity[userID] = time.Now().Unix()
+	c.mu.Unlock()
+}
+
+func (m *Client) SearchUsers(ctx context.Context, search *model.UserSearch) ([]*model.User, error) {
+	retryCount := 0
 	for {
-		mmusers, resp, err = m.Client.GetUsers(idx, max, "")
+		m.apiLogger.Warnf("SearchUsers: Term: %s #%d", search.Term, retryCount)
+
+		users, resp, err := m.Client.SearchUsers(ctx, search)
 		if err == nil {
+			return users, nil
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "SearchUsers", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+
+			continue
+		}
+
+		m.logger.Errorf("SearchUsers failed for %s: %v", search.Term, err)
+
+		return nil, err
+	}
+}
+
+//nolint:funlen,gocyclo
+func (c *UsersCache) SetUserCustomStatus(userID string, rawJSON string, tzLoc ...*time.Location) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.customStatuses == nil {
+		c.customStatuses = make(map[string]string)
+	}
+
+	if c.customStatusExpiresAt == nil {
+		c.customStatusExpiresAt = make(map[string]int64, 1000)
+	}
+
+	if rawJSON == "" || rawJSON == "{}" || rawJSON == "null" {
+		c.customStatuses[userID] = ""
+		delete(c.customStatusExpiresAt, userID)
+
+		return
+	}
+
+	var status CustomStatus
+
+	err := json.Unmarshal([]byte(rawJSON), &status)
+	if err != nil {
+		c.customStatuses[userID] = ""
+		delete(c.customStatusExpiresAt, userID)
+
+		return
+	}
+
+	var formattedStatus string
+
+	switch {
+	case status.Emoji != "" && status.Text != "":
+		formattedStatus = ":" + status.Emoji + ": " + status.Text
+	case status.Emoji != "":
+		formattedStatus = ":" + status.Emoji + ":"
+	default:
+		formattedStatus = status.Text
+	}
+
+	if formattedStatus == "" {
+		c.customStatuses[userID] = ""
+		delete(c.customStatusExpiresAt, userID)
+
+		return
+	}
+
+	if status.ExpiresAt == "" {
+		delete(c.customStatusExpiresAt, userID)
+		c.customStatuses[userID] = formattedStatus
+
+		return
+	}
+
+	expiry, parseErr := time.Parse(time.RFC3339, status.ExpiresAt)
+	if parseErr != nil {
+		delete(c.customStatusExpiresAt, userID)
+		c.customStatuses[userID] = formattedStatus
+
+		return
+	}
+
+	location := time.Local
+	if len(tzLoc) > 0 && tzLoc[0] != nil {
+		location = tzLoc[0]
+	}
+
+	now := time.Now().In(location)
+	expLocal := expiry.In(location)
+
+	if !expLocal.After(now) {
+		c.customStatuses[userID] = ""
+		delete(c.customStatusExpiresAt, userID)
+
+		return
+	}
+
+	timeStr := expLocal.Format("15:04")
+	nowDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
+	expDate := time.Date(expLocal.Year(), expLocal.Month(), expLocal.Day(), 0, 0, 0, 0, location)
+	daysDiff := int(expDate.Sub(nowDate).Hours() / 24)
+
+	var dateStr string
+
+	switch daysDiff {
+	case 0:
+		dateStr = "Today at " + timeStr
+	case 1:
+		dateStr = "Tomorrow at " + timeStr
+	default:
+		dateStr = expLocal.Format("Mon, 02 Jan 15:04")
+	}
+
+	var userLoc *time.Location
+
+	if targetUser := c.users[userID]; targetUser != nil && len(targetUser.Timezone) > 0 {
+		if targetUser.Timezone["automaticTimezone"] != "" || targetUser.Timezone["manualTimezone"] != "" {
+			userLoc = targetUser.GetTimezoneLocation()
+		}
+	}
+
+	if userLoc != nil {
+		userTimeStr := expiry.In(userLoc).Format("15:04")
+
+		if userTimeStr != timeStr {
+			dateStr += ", local time: " + userTimeStr
+		}
+	}
+
+	c.customStatusExpiresAt[userID] = expiry.Unix()
+	c.customStatuses[userID] = formattedStatus + " (Until " + dateStr + ")"
+}
+
+func (m *Client) SetUserStatus(userID string, rawStatus string, batchLock bool, lastActivityAt ...int64) string {
+	statusStr := model.StatusOffline
+	switch rawStatus {
+	case model.StatusOnline:
+		statusStr = model.StatusOnline
+	case model.StatusAway:
+		statusStr = model.StatusAway
+	case model.StatusDnd:
+		statusStr = model.StatusDnd
+	case model.StatusOutOfOffice:
+		statusStr = model.StatusOutOfOffice
+	}
+
+	if !batchLock {
+		m.Users.mu.Lock()
+		defer m.Users.mu.Unlock()
+	}
+
+	if m.Users.statusLastUpdated == nil {
+		m.Users.statusLastUpdated = make(map[string]int64, 1000)
+	}
+
+	m.Users.statuses[userID] = statusStr
+
+	if len(lastActivityAt) > 0 {
+		m.Users.statusLastUpdated[userID] = time.Now().Unix()
+	}
+
+	if len(lastActivityAt) > 0 && lastActivityAt[0] > 0 {
+		if m.Users.lastUserActivity == nil {
+			m.Users.lastUserActivity = make(map[string]int64, 1000)
+		}
+
+		if lastActivityAt[0] > m.Users.lastUserActivity[userID] {
+			m.Users.lastUserActivity[userID] = lastActivityAt[0]
+		}
+	}
+
+	m.Users.lastUpdated.Store(time.Now().Unix())
+
+	return statusStr
+}
+
+//nolint:funlen,gocognit,gocyclo
+func (m *Client) UpdateUsers(ctx context.Context) error {
+	const batchSize = mattermostPerPageMax
+
+	idx := 0
+	retryCount := 0
+	for {
+		if m.IsAborted(ctx) {
+			return errors.New("login aborted")
+		}
+
+		query := "/users?page=" + strconv.Itoa(idx) + "&per_page=" + strconv.Itoa(batchSize)
+		m.apiLogger.Warnf("UpdateUsers: DoAPIGet: query %s #%d", query, retryCount)
+		resp, err := m.Client.DoAPIGet(ctx, query, "")
+		if err != nil {
+			var mResp *model.Response
+			if resp != nil {
+				mResp = model.BuildResponse(resp)
+			}
+			shouldRetry, hErr := m.HandleRetry(ctx, "GetUsers", err, retryCount, 10, mResp)
+			if hErr == nil && shouldRetry {
+				retryCount++
+				continue
+			}
+			m.logger.Errorf("UpdateUsers failed at batch %d: %v", idx, err)
+			return err
+		}
+		retryCount = 0
+
+		var list []UserSummary
+		if jsonErr := json.NewDecoder(resp.Body).Decode(&list); jsonErr != nil {
+			resp.Body.Close()
+			return jsonErr
+		}
+		resp.Body.Close()
+
+		m.Users.mu.Lock()
+		for _, u := range list {
+			m.UpdateUserSummary(&u, true)
+		}
+		m.Users.lastUpdated.Store(time.Now().Unix())
+		m.Users.mu.Unlock()
+
+		if len(list) < batchSize {
 			break
 		}
 
-		if err = m.HandleRatelimit("GetUsers", resp); err != nil {
-			return err
-		}
-	}
-
-	for len(mmusers) > 0 {
-		m.Lock()
-
-		for _, user := range mmusers {
-			m.Users[user.Id] = user
-		}
-
-		m.Unlock()
-
-		for {
-			mmusers, resp, err = m.Client.GetUsers(idx, max, "")
-			if err == nil {
-				idx++
-
-				break
-			}
-
-			if err := m.HandleRatelimit("GetUsers", resp); err != nil {
-				return err
-			}
-		}
+		idx++
 	}
 
 	return nil
 }
 
-func (m *Client) UpdateUserNick(nick string) error {
-	user := m.User
-	user.Nickname = nick
+func (m *Client) UpdateUserNick(ctx context.Context, nick string) error {
+	m.RLock()
+	if m.User == nil {
+		m.RUnlock()
 
-	_, _, err := m.Client.UpdateUser(user)
-	if err != nil {
+		return fmt.Errorf("current user profile is not loaded")
+	}
+
+	userClone := *m.User
+	m.RUnlock()
+	userClone.Nickname = nick
+
+	retryCount := 0
+	for {
+		m.apiLogger.Warnf("UpdateUserNick: nick: %s #%d", nick, retryCount)
+
+		updatedUser, resp, err := m.Client.UpdateUser(ctx, &userClone)
+		if err == nil {
+			m.Lock()
+			m.User = updatedUser
+			m.Unlock()
+			m.UpdateUser(updatedUser)
+
+			return nil
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "UpdateUser", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+
+			continue
+		}
+
+		m.logger.Errorf("UpdateUserNick failed for %s: %v", nick, err)
+
 		return err
 	}
-
-	return nil
 }
 
-func (m *Client) UsernamesInChannel(channelID string) []string {
-	res, _, err := m.Client.GetChannelMembers(channelID, 0, 50000, "")
-	if err != nil {
-		m.logger.Errorf("UsernamesInChannel(%s) failed: %s", channelID, err)
+func (m *Client) UsernamesInChannel(ctx context.Context, channelID string) []string {
+	const batchSize = mattermostPerPageMax
 
-		return []string{}
-	}
+	result := make([]string, 0, batchSize)
+	channelName := m.GetCachedChannelName(channelID)
 
-	allusers := m.GetUsers()
-	result := []string{}
+	idx := 0
+	retryCount := 0
+	for {
+		m.apiLogger.Warnf("UsernamesInChannel: GetChannelMembers: Channel: %s (%s), Page: %d, PerPage: %d #%d", channelName, channelID, idx, batchSize, retryCount)
+		res, resp, err := m.Client.GetChannelMembers(ctx, channelID, idx, batchSize, "")
+		if err != nil {
+			shouldRetry, hErr := m.HandleRetry(ctx, "UsernamesInChannel", err, retryCount, 10, resp)
+			if hErr == nil && shouldRetry {
+				retryCount++
+				continue
+			}
 
-	for _, member := range res {
-		result = append(result, allusers[member.UserId].Nickname)
+			m.logger.Errorf("UsernamesInChannel %s (%s) failed: %s", channelName, channelID, err)
+			return result
+		}
+		retryCount = 0
+
+		for _, member := range res {
+			user := m.GetUser(ctx, member.UserId)
+			if user == nil {
+				continue
+			}
+
+			if user.Nickname != "" {
+				result = append(result, user.Nickname)
+			} else {
+				result = append(result, user.Username)
+			}
+		}
+
+		if len(res) < batchSize {
+			break
+		}
+
+		idx++
 	}
 
 	return result
 }
 
-func (m *Client) UpdateStatus(userID string, status string) error {
-	_, _, err := m.Client.UpdateUserStatus(userID, &model.Status{Status: status})
-	if err != nil {
+func (m *Client) UpdateStatus(ctx context.Context, userID string, status string) error {
+	userName := m.GetCachedUserName(userID)
+	retryCount := 0
+
+	for {
+		m.apiLogger.Warnf("UpdateStatus: User: %s (%s), Status: %s #%d", userName, userID, status, retryCount)
+
+		_, resp, err := m.Client.UpdateUserStatus(ctx, userID, &model.Status{
+			UserId: userID,
+			Status: status,
+		})
+		if err == nil {
+			m.SetUserStatus(userID, status, false)
+
+			return nil
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "UpdateUserStatus", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+
+			continue
+		}
+
+		m.logger.Errorf("UpdateStatus failed for %s (%s): %v", userName, userID, err)
+
 		return err
 	}
-
-	return nil
 }
 
-func (m *Client) UpdateUser(userID string) {
-	m.Lock()
-	defer m.Unlock()
+func (m *Client) UpdateTeamUsersCacheRemove(teamID, userID string) {
+	m.Users.mu.Lock()
+	defer m.Users.mu.Unlock()
 
-	res, _, err := m.Client.GetUser(userID, "")
-	if err != nil {
+	if userMap, exists := m.Users.teams[teamID]; exists {
+		delete(userMap, userID)
+	}
+}
+
+func (m *Client) UpdateUser(user *model.User, batchLock ...bool) *model.User {
+	if user == nil {
+		return nil
+	}
+
+	hasBatchLock := len(batchLock) > 0 && batchLock[0]
+	if !hasBatchLock {
+		m.Users.mu.Lock()
+		defer m.Users.mu.Unlock()
+
+		m.Users.lastUpdated.Store(time.Now().Unix())
+	}
+
+	return m.updateUserLocked(
+		user.Id,
+		user.UpdateAt,
+		user.DeleteAt,
+		user.Username,
+		user.FirstName,
+		user.LastName,
+		user.Nickname,
+		user.Roles,
+		user.Props,
+		user.Timezone,
+	)
+}
+
+func (m *Client) UpdateUserSummary(u *UserSummary, batchLock ...bool) *model.User {
+	if u == nil {
+		return nil
+	}
+
+	hasBatchLock := len(batchLock) > 0 && batchLock[0]
+	if !hasBatchLock {
+		m.Users.mu.Lock()
+		defer m.Users.mu.Unlock()
+
+		m.Users.lastUpdated.Store(time.Now().Unix())
+	}
+
+	return m.updateUserLocked(
+		u.Id,
+		u.UpdateAt,
+		u.DeleteAt,
+		u.Username,
+		u.FirstName,
+		u.LastName,
+		u.Nickname,
+		u.Roles,
+		u.Props,
+		u.Timezone,
+	)
+}
+
+//nolint:funlen
+func (m *Client) updateUserLocked(id string, updateAt int64, deleteAt int64, username, firstName, lastName, nickname, roles string, props map[string]string, timezone map[string]string) *model.User {
+	switch roles {
+	case "system_user":
+		roles = "system_user"
+	case "system_admin system_user":
+		roles = "system_admin system_user"
+	}
+
+	cachedUser, exists := m.Users.users[id]
+	if !exists {
+		cachedUser = &model.User{
+			Id:        id,
+			UpdateAt:  max(0, updateAt),
+			DeleteAt:  max(0, deleteAt),
+			Username:  username,
+			FirstName: firstName,
+			LastName:  lastName,
+			Nickname:  nickname,
+			Roles:     roles,
+			Props:     props,
+			Timezone:  timezone,
+		}
+		m.Users.users[id] = cachedUser
+
+		return cachedUser
+	}
+
+	if updateAt > 0 && cachedUser.UpdateAt != updateAt {
+		cachedUser.UpdateAt = updateAt
+	}
+
+	if deleteAt >= 0 && cachedUser.DeleteAt != deleteAt {
+		cachedUser.DeleteAt = deleteAt
+	}
+
+	if cachedUser.Username != username {
+		cachedUser.Username = username
+	}
+
+	if cachedUser.FirstName != firstName {
+		cachedUser.FirstName = firstName
+	}
+
+	if cachedUser.LastName != lastName {
+		cachedUser.LastName = lastName
+	}
+
+	if cachedUser.Nickname != nickname {
+		cachedUser.Nickname = nickname
+	}
+
+	if cachedUser.Roles != roles {
+		cachedUser.Roles = roles
+	}
+
+	if props != nil {
+		cachedUser.Props = props
+	}
+
+	if timezone != nil {
+		cachedUser.Timezone = timezone
+	}
+
+	return cachedUser
+}
+
+// WsGetStatuses requests all user statuses over the WebSocket.
+func (m *Client) WsGetStatuses() {
+	if m.WsClient == nil || !m.WsConnected {
 		return
 	}
 
-	m.Users[userID] = res
+	_ = wsSafely(func() { m.WsClient.GetStatuses() })
+}
+
+// WsGetStatusesByIds requests statuses for specific user IDs in batches over the WebSocket.
+func (m *Client) WsGetStatusesByIds(userIDs []string) {
+	if m.WsClient == nil || !m.WsConnected || len(userIDs) == 0 {
+		return
+	}
+
+	m.logger.Debugf("WsGetStatusesByIds: requesting statuses for %d users", len(userIDs))
+
+	// Mattermost SocketMaxMessageSizeKb   = 8 * 1024 // 8KB
+	// 250 user IDs * 29 bytes = ~7.3 KBytes + JSON framing = ~7.5 KBytes
+	const batchSize = 250
+
+	for i := 0; i < len(userIDs); i += batchSize {
+		end := min(i+batchSize, len(userIDs))
+		batch := userIDs[i:end]
+
+		m.logger.Tracef("WsGetStatusesByIds: batch %d-%d of %d: %v", i+1, end, len(userIDs), batch)
+
+		_ = wsSafely(func() { m.WsClient.GetStatusesByIds(batch) })
+	}
 }

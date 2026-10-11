@@ -8,10 +8,9 @@ package whatsmeow
 
 import (
 	"context"
-	"math/rand"
+	"math/rand/v2"
 	"time"
 
-	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -28,14 +27,14 @@ var (
 	KeepAliveMaxFailTime = 3 * time.Minute
 )
 
-func (cli *Client) keepAliveLoop(ctx context.Context) {
+func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
 	lastSuccess := time.Now()
 	var errorCount int
 	for {
-		interval := rand.Int63n(KeepAliveIntervalMax.Milliseconds()-KeepAliveIntervalMin.Milliseconds()) + KeepAliveIntervalMin.Milliseconds()
+		interval := rand.Int64N(KeepAliveIntervalMax.Milliseconds()-KeepAliveIntervalMin.Milliseconds()) + KeepAliveIntervalMin.Milliseconds()
 		select {
 		case <-time.After(time.Duration(interval) * time.Millisecond):
-			isSuccess, shouldContinue := cli.sendKeepAlive(ctx)
+			isSuccess, shouldContinue := cli.sendKeepAlive(connCtx)
 			if !shouldContinue {
 				return
 			} else if !isSuccess {
@@ -47,7 +46,8 @@ func (cli *Client) keepAliveLoop(ctx context.Context) {
 				if cli.EnableAutoReconnect && time.Since(lastSuccess) > KeepAliveMaxFailTime {
 					cli.Log.Debugf("Forcing reconnect due to keepalive failure")
 					cli.Disconnect()
-					go cli.autoReconnect()
+					cli.resetExpectedDisconnect()
+					go cli.autoReconnect(ctx)
 				}
 			} else {
 				if errorCount > 0 {
@@ -56,20 +56,21 @@ func (cli *Client) keepAliveLoop(ctx context.Context) {
 				}
 				lastSuccess = time.Now()
 			}
-		case <-ctx.Done():
+		case <-connCtx.Done():
 			return
 		}
 	}
 }
 
 func (cli *Client) sendKeepAlive(ctx context.Context) (isSuccess, shouldContinue bool) {
-	respCh, err := cli.sendIQAsync(infoQuery{
+	respCh, err := cli.sendIQAsync(ctx, infoQuery{
 		Namespace: "w:p",
 		Type:      "get",
 		To:        types.ServerJID,
-		Content:   []waBinary.Node{{Tag: "ping"}},
 	})
-	if err != nil {
+	if ctx.Err() != nil {
+		return false, false
+	} else if err != nil {
 		cli.Log.Warnf("Failed to send keepalive: %v", err)
 		return false, true
 	}

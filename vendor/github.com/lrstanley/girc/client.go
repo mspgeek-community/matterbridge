@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log" //nolint:depguard
 	"net"
 	"os"
 	"runtime"
@@ -107,6 +107,13 @@ type Config struct {
 	// strict transport policy expires and the first attempt to reconnect back to
 	// the tls version fails.
 	DisableSTSFallback bool
+	// DisableAutoWHOOnJoin disables the automatic WHO request sent when this
+	// client joins a channel. Channel/user tracking remains enabled, and can
+	// still be populated by NAMES replies and subsequent channel events.
+	DisableAutoWHOOnJoin bool
+	// DisableAutoMODEOnJoin disables the automatic MODE request sent when this
+	// client joins a channel.
+	DisableAutoMODEOnJoin bool
 	// TLSConfig is an optional user-supplied tls configuration, used during
 	// socket creation to the server. SSL must be enabled for this to be used.
 	// This only has an affect during the dial process.
@@ -210,19 +217,24 @@ func (w WebIRC) Params() []string {
 	return []string{w.Password, w.Gateway, w.Hostname, w.Address}
 }
 
-// ErrInvalidConfig is returned when the configuration passed to the client
+// ErrInvalidConfig is aliased to InvalidConfigError.
+//
+// Deprecated: use InvalidConfigError instead.
+type ErrInvalidConfig = InvalidConfigError //nolint:errname
+
+// InvalidConfigError is returned when the configuration passed to the client
 // is invalid.
-type ErrInvalidConfig struct {
+type InvalidConfigError struct {
 	Conf Config // Conf is the configuration that was not valid.
 	err  error
 }
 
-func (e ErrInvalidConfig) Error() string { return "invalid configuration: " + e.err.Error() }
+func (e InvalidConfigError) Error() string { return "invalid configuration: " + e.err.Error() }
 
 // isValid checks some basic settings to ensure the config is valid.
 func (conf *Config) isValid() error {
 	if conf.Server == "" {
-		return &ErrInvalidConfig{Conf: *conf, err: errors.New("empty server")}
+		return &InvalidConfigError{Conf: *conf, err: errors.New("empty server")}
 	}
 
 	// Default port to 6667 (the standard IRC port).
@@ -231,14 +243,14 @@ func (conf *Config) isValid() error {
 	}
 
 	if conf.Port < 1 || conf.Port > 65535 {
-		return &ErrInvalidConfig{Conf: *conf, err: errors.New("port outside valid range (1-65535)")}
+		return &InvalidConfigError{Conf: *conf, err: errors.New("port outside valid range (1-65535)")}
 	}
 
 	if !IsValidNick(conf.Nick) {
-		return &ErrInvalidConfig{Conf: *conf, err: errors.New("bad nickname specified")}
+		return &InvalidConfigError{Conf: *conf, err: errors.New("bad nickname specified")}
 	}
 	if !IsValidUser(conf.User) {
-		return &ErrInvalidConfig{Conf: *conf, err: errors.New("bad user/ident specified")}
+		return &InvalidConfigError{Conf: *conf, err: errors.New("bad user/ident specified")}
 	}
 
 	return nil
@@ -312,11 +324,7 @@ func New(config Config) *Client {
 // the event can't be sent within 30s.
 func (c *Client) receive(e *Event) {
 	t := time.NewTimer(30 * time.Second)
-	defer func() {
-		if !t.Stop() {
-			<-t.C
-		}
-	}()
+	defer t.Stop()
 
 	select {
 	case c.rx <- e:
@@ -390,14 +398,19 @@ func (c *Client) Quit(reason string) {
 	c.Send(&Event{Command: QUIT, Params: []string{reason}})
 }
 
-// ErrEvent is an error returned when the server (or library) sends an ERROR
+// ErrEvent is an alias to EventError.
+//
+// Deprecated: use EventError instead.
+type ErrEvent = EventError //nolint:errname
+
+// EventError is an error returned when the server (or library) sends an ERROR
 // message response. The string returned contains the trailing text from the
 // message.
-type ErrEvent struct {
+type EventError struct {
 	Event *Event
 }
 
-func (e *ErrEvent) Error() string {
+func (e *EventError) Error() string {
 	if e.Event == nil {
 		return "unknown error occurred"
 	}
@@ -442,7 +455,7 @@ func (c *Client) execLoop(ctx context.Context) error {
 				// if this library is the source of the error, this should
 				// signal back up to the main connect loop, to disconnect.
 
-				return &ErrEvent{Event: event}
+				return &EventError{Event: event}
 			}
 		}
 	}
@@ -727,12 +740,12 @@ func (c *Client) GetServerOptionInt(key string) (result int, ok bool) {
 // by the protocol. If state tracking is enabled, this will utilize ISUPPORT/IRCv3
 // information to more accurately calculate the maximum supported length (i.e. extended
 // length events).
-func (c *Client) MaxEventLength() (max int) {
+func (c *Client) MaxEventLength() (maxLen int) {
 	if !c.Config.disableTracking {
 		c.state.RLock()
-		max = c.state.maxLineLength - c.state.maxPrefixLength
+		maxLen = c.state.maxLineLength - c.state.maxPrefixLength
 		c.state.RUnlock()
-		return max
+		return maxLen
 	}
 	return DefaultMaxLineLength - DefaultMaxPrefixLength
 }

@@ -7,17 +7,18 @@
 package whatsmeow
 
 import (
+	"context"
 	"fmt"
 
+	"go.mau.fi/util/random"
 	"google.golang.org/protobuf/proto"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
-	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"go.mau.fi/whatsmeow/util/gcmutil"
 	"go.mau.fi/whatsmeow/util/hkdfutil"
-	"go.mau.fi/whatsmeow/util/randbytes"
 )
 
 func getMediaRetryKey(mediaKey []byte) (cipherKey []byte) {
@@ -25,8 +26,8 @@ func getMediaRetryKey(mediaKey []byte) (cipherKey []byte) {
 }
 
 func encryptMediaRetryReceipt(messageID types.MessageID, mediaKey []byte) (ciphertext, iv []byte, err error) {
-	receipt := &waProto.ServerErrorReceipt{
-		StanzaId: proto.String(messageID),
+	receipt := &waMmsRetry.ServerErrorReceipt{
+		StanzaID: proto.String(messageID),
 	}
 	var plaintext []byte
 	plaintext, err = proto.Marshal(receipt)
@@ -34,7 +35,7 @@ func encryptMediaRetryReceipt(messageID types.MessageID, mediaKey []byte) (ciphe
 		err = fmt.Errorf("failed to marshal payload: %w", err)
 		return
 	}
-	iv = randbytes.Make(12)
+	iv = random.Bytes(12)
 	ciphertext, err = gcmutil.Encrypt(getMediaRetryKey(mediaKey), iv, plaintext, []byte(messageID))
 	return
 }
@@ -44,7 +45,7 @@ func encryptMediaRetryReceipt(messageID types.MessageID, mediaKey []byte) (ciphe
 // This is mostly relevant when handling history syncs and getting a 404 or 410 error downloading media.
 // Rough example on how to use it (will not work out of the box, you must adjust it depending on what you need exactly):
 //
-//	var mediaRetryCache map[types.MessageID]*waProto.ImageMessage
+//	var mediaRetryCache map[types.MessageID]*waE2E.ImageMessage
 //
 //	evt, err := cli.ParseWebMessage(chatJID, historyMsg.GetMessage())
 //	imageMsg := evt.Message.GetImageMessage() // replace this with the part of the message you want to download
@@ -59,12 +60,12 @@ func encryptMediaRetryReceipt(messageID types.MessageID, mediaKey []byte) (ciphe
 // using DecryptMediaRetryNotification and the same media key passed here. If the media retry was successful,
 // the decrypted notification should contain an updated DirectPath, which can be used to download the file.
 //
-//	func eventHandler(rawEvt interface{}) {
+//	func eventHandler(rawEvt any) {
 //	  switch evt := rawEvt.(type) {
 //	  case *events.MediaRetry:
 //	    imageMsg := mediaRetryCache[evt.MessageID]
 //	    retryData, err := whatsmeow.DecryptMediaRetryNotification(evt, imageMsg.GetMediaKey())
-//	    if err != nil || retryData.GetResult != waProto.MediaRetryNotification_SUCCESS {
+//	    if err != nil || retryData.GetResult != waMmsRetry.MediaRetryNotification_SUCCESS {
 //	      return
 //	    }
 //	    // Use the new path to download the attachment
@@ -73,7 +74,10 @@ func encryptMediaRetryReceipt(messageID types.MessageID, mediaKey []byte) (ciphe
 //	    // Alternatively, you can use cli.DownloadMediaWithPath and provide the individual fields manually.
 //	  }
 //	}
-func (cli *Client) SendMediaRetryReceipt(message *types.MessageInfo, mediaKey []byte) error {
+func (cli *Client) SendMediaRetryReceipt(ctx context.Context, message *types.MessageInfo, mediaKey []byte) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
 	ciphertext, iv, err := encryptMediaRetryReceipt(message.ID, mediaKey)
 	if err != nil {
 		return fmt.Errorf("failed to prepare encrypted retry receipt: %w", err)
@@ -96,7 +100,7 @@ func (cli *Client) SendMediaRetryReceipt(message *types.MessageInfo, mediaKey []
 		{Tag: "enc_iv", Content: iv},
 	}
 
-	err = cli.sendNode(waBinary.Node{
+	err = cli.sendNode(ctx, waBinary.Node{
 		Tag: "receipt",
 		Attrs: waBinary.Attrs{
 			"id":   message.ID,
@@ -116,8 +120,8 @@ func (cli *Client) SendMediaRetryReceipt(message *types.MessageInfo, mediaKey []
 
 // DecryptMediaRetryNotification decrypts a media retry notification using the media key.
 // See Client.SendMediaRetryReceipt for more info on how to use this.
-func DecryptMediaRetryNotification(evt *events.MediaRetry, mediaKey []byte) (*waProto.MediaRetryNotification, error) {
-	var notif waProto.MediaRetryNotification
+func DecryptMediaRetryNotification(evt *events.MediaRetry, mediaKey []byte) (*waMmsRetry.MediaRetryNotification, error) {
+	var notif waMmsRetry.MediaRetryNotification
 	if evt.Error != nil && evt.Ciphertext == nil {
 		if evt.Error.Code == 2 {
 			return nil, ErrMediaNotAvailableOnPhone
@@ -171,7 +175,7 @@ func parseMediaRetryNotification(node *waBinary.Node) (*events.MediaRetry, error
 	return &evt, nil
 }
 
-func (cli *Client) handleMediaRetryNotification(node *waBinary.Node) {
+func (cli *Client) handleMediaRetryNotification(ctx context.Context, node *waBinary.Node) {
 	evt, err := parseMediaRetryNotification(node)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse media retry notification: %v", err)

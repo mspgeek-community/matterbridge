@@ -102,7 +102,7 @@ func handleConnect(c *Client, e Event) {
 
 // nickCollisionHandler helps prevent the client from having conflicting
 // nicknames with another bot, user, etc.
-func nickCollisionHandler(c *Client, e Event) {
+func nickCollisionHandler(c *Client, _ Event) {
 	if c.Config.HandleNickCollide == nil {
 		c.Cmd.Nick(c.GetNick() + "_")
 		return
@@ -119,7 +119,7 @@ func handlePING(c *Client, e Event) {
 	c.Cmd.Pong(e.Last())
 }
 
-func handlePONG(c *Client, e Event) {
+func handlePONG(c *Client, _ Event) {
 	c.conn.mu.Lock()
 	c.conn.lastPong = time.Now()
 	c.conn.mu.Unlock()
@@ -174,10 +174,14 @@ func handleJOIN(c *Client, e Event) {
 	if e.Source.ID() == c.GetID() {
 		// If it's us, don't just add our user to the list. Run a WHO which
 		// will tell us who exactly is in the entire channel.
-		c.Send(&Event{Command: WHO, Params: []string{channelName, "%tacuhnr,1"}})
+		if !c.Config.DisableAutoWHOOnJoin {
+			c.Send(&Event{Command: WHO, Params: []string{channelName, "%tacuhnr,1"}})
+		}
 
 		// Also send a MODE to obtain the list of channel modes.
-		c.Send(&Event{Command: MODE, Params: []string{channelName}})
+		if !c.Config.DisableAutoMODEOnJoin {
+			c.Send(&Event{Command: MODE, Params: []string{channelName}})
+		}
 
 		// Update our ident and host too, in state -- since there is no
 		// cleaner method to do this.
@@ -223,14 +227,19 @@ func handlePART(c *Client, e Event) {
 // handleTOPIC handles incoming TOPIC events and keeps channel tracking info
 // updated with the latest channel topic.
 func handleTOPIC(c *Client, e Event) {
-	var name string
+	var name, topic string
 	switch len(e.Params) {
 	case 0:
 		return
-	case 1:
+	case 1: // TOPIC, message format is `TOPIC <channel>`
 		name = e.Params[0]
-	default:
+		topic = ""
+	case 2: // TOPIC, message format is `TOPIC <channel> :<topic>`
+		name = e.Params[0]
+		topic = e.Last()
+	default: // RPL_TOPIC, message format is `332 <client> <channel> :<topic>`
 		name = e.Params[1]
+		topic = e.Last()
 	}
 
 	c.state.Lock()
@@ -240,7 +249,7 @@ func handleTOPIC(c *Client, e Event) {
 		return
 	}
 
-	channel.Topic = e.Last()
+	channel.Topic = topic
 	c.state.Unlock()
 	c.state.notify(c, UPDATE_STATE)
 }
@@ -496,8 +505,9 @@ func handleNAMES(c *Client, e Event) {
 	var s *Source
 
 	c.state.Lock()
+	prefixModes, prefixes := parsePrefixes(c.state.userPrefixes())
 	for i := 0; i < len(parts); i++ {
-		modes, nick, ok = parseUserPrefix(parts[i])
+		modes, nick, ok = parseUserPrefix(parts[i], prefixes)
 		if !ok {
 			continue
 		}
@@ -508,7 +518,6 @@ func handleNAMES(c *Client, e Event) {
 			if s == nil {
 				continue
 			}
-
 		} else {
 			s = &Source{
 				Name: nick,
@@ -530,7 +539,7 @@ func handleNAMES(c *Client, e Event) {
 
 		// Don't append modes, overwrite them.
 		perms, _ := user.Perms.Lookup(channel.Name)
-		perms.set(modes, false)
+		perms.setPrefixes(modes, prefixModes, prefixes)
 		user.Perms.set(channel.Name, perms)
 	}
 	c.state.Unlock()

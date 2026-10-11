@@ -4,9 +4,9 @@ import (
 	"errors"
 	"regexp"
 	"strings"
-	"unicode"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/mspgeek-community/matterbridge/bridge/helper"
 )
 
 func (b *Bdiscord) getAllowedMentions() *discordgo.MessageAllowedMentions {
@@ -34,41 +34,115 @@ func (b *Bdiscord) getAllowedMentions() *discordgo.MessageAllowedMentions {
 }
 
 func (b *Bdiscord) getNick(user *discordgo.User, guildID string) string {
+	if user == nil {
+		return ""
+	}
+	member := b.memberByID(guildID, user.ID)
+	if member == nil {
+		return user.Username
+	}
+	b.membersMutex.Lock()
+	if _, ok := b.userMemberMap[user.ID]; !ok {
+		b.addMemberLocked(member)
+	}
+	b.membersMutex.Unlock()
+	if member.Nick != "" {
+		// Only return if nick is set.
+		return member.Nick
+	}
+	// Otherwise return username.
+	return user.Username
+}
+
+const memberPageSize = 1000
+
+func (b *Bdiscord) memberCount() int {
 	b.membersMutex.RLock()
 	defer b.membersMutex.RUnlock()
+	return len(b.userMemberMap)
+}
 
-	if member, ok := b.userMemberMap[user.ID]; ok {
-		if member.Nick != "" {
-			// Only return if nick is set.
-			return member.Nick
-		}
-		// Otherwise return username.
-		return user.Username
+// addMemberLocked records a guild member. membersMutex must be held.
+func (b *Bdiscord) addMemberLocked(member *discordgo.Member) {
+	if member == nil || member.User == nil {
+		return
 	}
-
-	// If we didn't find nick, search for it.
-	member, err := b.c.GuildMember(guildID, user.ID)
-	if err != nil {
-		b.Log.Warnf("Failed to fetch information for member %#v on guild %#v: %s", user, guildID, err)
-		return user.Username
-	} else if member == nil {
-		b.Log.Warnf("Got no information for member %#v", user)
-		return user.Username
-	}
-	b.userMemberMap[user.ID] = member
+	b.userMemberMap[member.User.ID] = member
 	b.nickMemberMap[member.User.Username] = member
 	if member.Nick != "" {
 		b.nickMemberMap[member.Nick] = member
-		return member.Nick
 	}
-	return user.Username
+	b.memberIndexDirty = true
+}
+
+// loadMemberPage loads one page of guild members after the given user ID. It
+// returns the last user ID seen and whether more members may follow.
+func (b *Bdiscord) loadMemberPage(after string) (string, bool, error) {
+	members, err := b.c.GuildMembers(b.guildID, after, memberPageSize)
+	if err != nil {
+		return after, false, err
+	}
+	b.membersMutex.Lock()
+	defer b.membersMutex.Unlock()
+	for _, member := range members {
+		if member == nil || member.User == nil {
+			b.Log.Warnf("Skipping missing information for a user.")
+			continue
+		}
+		b.addMemberLocked(member)
+		after = member.User.ID
+	}
+	return after, len(members) == memberPageSize, nil
+}
+
+// loadRemainingMembers pages through the rest of the guild members. It stops
+// when session is replaced by a reconnect.
+func (b *Bdiscord) loadRemainingMembers(session *discordgo.Session, after string) {
+	pages := 1
+	for {
+		b.connectMutex.Lock()
+		current := b.c == session
+		b.connectMutex.Unlock()
+		if !current {
+			return
+		}
+		var more bool
+		var err error
+		after, more, err = b.loadMemberPage(after)
+		if err != nil {
+			b.Log.Errorf("Loading server members failed after %d pages: %s", pages, err)
+			return
+		}
+		pages++
+		if !more {
+			b.Log.Infof("Loaded %d server members in %d pages", b.memberCount(), pages)
+			return
+		}
+	}
+}
+
+// memberNameIndex returns the name index for @mention resolution, rebuilding
+// it after member changes. Usernames, global display names and server
+// nicknames all resolve.
+func (b *Bdiscord) memberNameIndex() helper.NameIndex {
+	b.membersMutex.Lock()
+	defer b.membersMutex.Unlock()
+	if b.memberIndex == nil || b.memberIndexDirty {
+		idx := helper.NameIndex{}
+		for id, member := range b.userMemberMap {
+			idx.Add(id, member.User.Username, member.User.GlobalName, member.Nick)
+		}
+		b.memberIndex = idx
+		b.memberIndexDirty = false
+	}
+	return b.memberIndex
 }
 
 func (b *Bdiscord) getGuildMemberByNick(nick string) (*discordgo.Member, error) {
 	b.membersMutex.RLock()
 	defer b.membersMutex.RUnlock()
 
-	if member, ok := b.nickMemberMap[nick]; ok {
+	if member, ok := b.nickMemberMap[strings.TrimSpace(nick)]; ok {
 		return member, nil
 	}
 	return nil, errors.New("Couldn't find guild member with nick " + nick) // This will most likely get ignored by the caller
@@ -91,6 +165,41 @@ func (b *Bdiscord) getChannelID(name string) string {
 		}
 	}
 	return ""
+}
+
+// ChannelIDByName returns the Discord channel ID for a configured channel name.
+func (b *Bdiscord) ChannelIDByName(name string) string {
+	return b.getChannelID(name)
+}
+
+// UserMention returns the Discord mention of the member with these names (a
+// user reference from another platform).
+func (b *Bdiscord) UserMention(names []string) (string, bool) {
+	id, ok := helper.ResolveUserByNames(b.memberNameIndex(), names)
+	if !ok {
+		return "", false
+	}
+	return "<@" + id + ">", true
+}
+
+// ChannelMention returns the mention of the channel named exactly name, for
+// channel references from other platforms.
+func (b *Bdiscord) ChannelMention(name string) (string, bool) {
+	b.channelsMutex.RLock()
+	defer b.channelsMutex.RUnlock()
+	for _, channel := range b.channels {
+		if channel.Name == name {
+			return "<#" + channel.ID + ">", true
+		}
+	}
+	return "", false
+}
+
+// GuildID returns the ID of the Discord server this bridge is connected to.
+func (b *Bdiscord) GuildID() string {
+	b.channelsMutex.RLock()
+	defer b.channelsMutex.RUnlock()
+	return b.guildID
 }
 
 func (b *Bdiscord) getCategoryChannelID(name string) string {
@@ -192,28 +301,18 @@ func (b *Bdiscord) replaceChannelMentions(text string) string {
     }
     return channelMentionRE.ReplaceAllStringFunc(text, replaceChannelMentionFunc)
 }
+// replaceUserMentions turns "@name" into a Discord mention when name matches
+// a member's username, display name or nickname (ignoring case, spaces and
+// punctuation).
 func (b *Bdiscord) replaceUserMentions(text string) string {
-	replaceUserMentionFunc := func(match string) string {
-		var (
-			err      error
-			member   *discordgo.Member
-			username string
-		)
-
-		usernames := enumerateUsernames(match[1:])
-		for _, username = range usernames {
-			b.Log.Debugf("Testing mention: '%s'", username)
-			member, err = b.getGuildMemberByNick(username)
-			if err == nil {
-				break
-			}
+	idx := b.memberNameIndex()
+	return helper.ReplaceMentions(text, func(name string) (string, bool) {
+		id, ok := idx.Lookup(name)
+		if !ok {
+			return "", false
 		}
-		if member == nil {
-			return match
-		}
-		return strings.Replace(match, "@"+username, member.User.Mention(), 1)
-	}
-	return userMentionRE.ReplaceAllStringFunc(text, replaceUserMentionFunc)
+		return "<@" + id + ">", true
+	})
 }
 func (b *Bdiscord) sanitizeUsername(username string) string {
 	return strings.ReplaceAll(username, " ", "")
@@ -244,37 +343,3 @@ func (b *Bdiscord) splitURL(url string) (string, string, bool) {
 	return webhookURLSplit[webhookIdxID], webhookURLSplit[webhookIdxToken], true
 }
 
-func enumerateUsernames(s string) []string {
-	onlySpace := true
-	for _, r := range s {
-		if !unicode.IsSpace(r) {
-			onlySpace = false
-			break
-		}
-	}
-	if onlySpace {
-		return nil
-	}
-
-	var username, endSpace string
-	var usernames []string
-	skippingSpace := true
-	for _, r := range s {
-		if unicode.IsSpace(r) {
-			if !skippingSpace {
-				usernames = append(usernames, username)
-				skippingSpace = true
-			}
-			endSpace += string(r)
-			username += string(r)
-		} else {
-			endSpace = ""
-			username += string(r)
-			skippingSpace = false
-		}
-	}
-	if endSpace == "" {
-		usernames = append(usernames, username)
-	}
-	return usernames
-}

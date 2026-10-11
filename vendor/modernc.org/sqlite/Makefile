@@ -1,242 +1,142 @@
-# Copyright 2017 The Sqlite Authors. All rights reserved.
+# Copyright 2024 The Sqlite Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
 
-.PHONY:	all clean cover cpu editor internalError later mem nuke todo edit tcl extraquick full tidy uncomment unconvert
+.PHONY:	all build_all_targets clean edit editor licenses sbom test test_pcache vendor work
 
-grep=--include=*.go --include=*.l --include=*.y --include=*.yy
-ngrep='TODOOK\|internal\/vfs\|internal\/bin\|internal\/mptest\|.*stringer.*\.go'
-host=$(shell go env GOOS)-$(shell go env GOARCH)
-testlog=testdata/testlog-$(shell echo $$GOOS)-$(shell echo $$GOARCH)$(shell echo $$SQLITE_TEST_SUFFIX)
+# Pinned deduplicator. undup folds byte-identical declarations shared across the
+# per-target generated files in lib/ and vec/ into build-tagged shared files,
+# keeping each tag's module download under Go's 500MB cap. Bump deliberately.
+UNDUP = modernc.org/undup@v0.0.5
+
+# Extra flags for the vendor tool's -preflight and -stamp steps. The one there
+# is: make vendor VENDORFLAGS=-allow-dirty vendors from a sibling checkout with
+# uncommitted changes, such as a debug build of libsqlite3 (see doc.go), and
+# records that in vendor.json. The recipe's last step then fails, as does
+# TestVendorStamp, so such a tree is never committed or released.
+VENDORFLAGS =
 
 all: editor
-	date
-	go version 2>&1 | tee log
-	./unconvert.sh
-	gofmt -l -s -w *.go
-	go test -i
-	go test -v 2>&1 -timeout 24h | tee -a log
-	go run speedtest1/main_$(shell go env GOOS)_$(shell go env GOARCH).go
-	golint 2>&1 | grep -v $(ngrep) || true
-	misspell *.go
-	staticcheck || true
-	maligned || true
-	git diff --unified=0 testdata *.golden
-	grep -n --color=always 'FAIL\|PASS' log
-	go version
-	date 2>&1 | tee -a log
-
-# $ go install modernc.org/uncomment@latest
-uncomment:
-	uncomment -v -gofmt libtest/sqlite*.go internal/mptest/main*.go internal/testfixture/testfixture*.go speedtest1/main*.go vfs/vfs*.go
-	uncomment -v -gofmt -keep-godoc lib/sqlite*.go
-
-# $ go install github.com/mdempsky/unconvert@latest
-unconvert:
-	./unconvert.sh && echo ok || echo fail
-
-tidy: uncomment unconvert
-	gofmt -l -s -w .
+	golint 2>&1
+	staticcheck 2>&1
 
 build_all_targets:
 	GOOS=darwin GOARCH=amd64 go test -c -o /dev/null
+	GOOS=darwin GOARCH=amd64 go build -v ./...
 	GOOS=darwin GOARCH=arm64 go test -c -o /dev/null
+	GOOS=darwin GOARCH=arm64 go build -v ./...
 	GOOS=freebsd GOARCH=amd64 go test -c -o /dev/null
+	GOOS=freebsd GOARCH=amd64 go build -v ./...
 	GOOS=freebsd GOARCH=386 go test -c -o /dev/null
+	GOOS=freebsd GOARCH=386 go build -v ./...
 	GOOS=freebsd GOARCH=arm go test -c -o /dev/null
+	GOOS=freebsd GOARCH=arm go build -v ./...
 	GOOS=freebsd GOARCH=arm64 go test -c -o /dev/null
+	GOOS=freebsd GOARCH=arm64 go build -v ./...
 	GOOS=linux GOARCH=386 go test -c -o /dev/null
+	GOOS=linux GOARCH=386 go build -v ./...
 	GOOS=linux GOARCH=amd64 go test -c -o /dev/null
+	GOOS=linux GOARCH=amd64 go build -v ./...
 	GOOS=linux GOARCH=arm go test -c -o /dev/null
+	GOOS=linux GOARCH=arm go build -v ./...
 	GOOS=linux GOARCH=arm64 go test -c -o /dev/null
+	GOOS=linux GOARCH=arm64 go build -v ./...
+	GOOS=linux GOARCH=loong64 go test -c -o /dev/null
+	GOOS=linux GOARCH=loong64 go build -v ./...
 	GOOS=linux GOARCH=ppc64le go test -c -o /dev/null
+	GOOS=linux GOARCH=ppc64le go build -v ./...
 	GOOS=linux GOARCH=riscv64 go test -c -o /dev/null
+	GOOS=linux GOARCH=riscv64 go build -v ./...
 	GOOS=linux GOARCH=s390x go test -c -o /dev/null
+	GOOS=linux GOARCH=s390x go build -v ./...
 	GOOS=netbsd GOARCH=amd64 go test -c -o /dev/null
+	GOOS=netbsd GOARCH=amd64 go build -v ./...
 	GOOS=openbsd GOARCH=amd64 go test -c -o /dev/null
+	GOOS=openbsd GOARCH=amd64 go build -v ./...
 	GOOS=openbsd GOARCH=arm64 go test -c -o /dev/null
-	# GOOS=windows GOARCH=386 go test -c -o /dev/null
-	GOOS=windows GOARCH=amd64 go test -c -o /dev/null
-	GOOS=windows GOARCH=arm64 go test -c -o /dev/null
-	echo done
-
-# 3900x
-windows_amd64:
-	@echo "Should be executed only on linux/amd64."
-	CCGO_CPP=x86_64-w64-mingw32-cpp TARGET_GOOS=windows TARGET_GOARCH=amd64 go generate 2>&1 | tee log-generate
-	GOOS=windows GOARCH=amd64 go test -c -o /dev/null
-
-windows_arm64:
-	go run addport.go windows_amd64 windows_arm64
-	GOOS=windows GOARCH=arm64 go test -c -o /dev/null
-
-# 3900x
-windows_386:
-	@echo "Should be executed only on linux/amd64."
-	CCGO_CPP=i686-w64-mingw32-cpp TARGET_GOOS=windows TARGET_GOARCH=386 go generate 2>&1 | tee log-generate
+	GOOS=openbsd GOARCH=arm64 go build -v ./...
 	GOOS=windows GOARCH=386 go test -c -o /dev/null
-
-# 3900x/qemu
-darwin_amd64:
-	@echo "Should be executed only on darwin/amd64."
-	go generate 2>&1 | tee log-generate
-	go test -c -o /dev/null
-
-# 3900x/qemu
-netbsd_amd64:
-	@echo "Should be executed only on netbsd/amd64."
-	go generate 2>&1 | tee log-generate
-	go test -c -o /dev/null
-
-# darwin-m1
-darwin_arm64:
-	@echo "Should be executed only on darwin/arm64."
-	go generate 2>&1 | tee log-generate
-	go test -c -o /dev/null
-
-# 3900x/qemu
-freebsd_amd64:
-	@echo "Should be executed only on freebsd/amd64."
-	go generate 2>&1 | tee log-generate
-	go test -c -o /dev/null
-
-freebsd_arm64:
-	go run addport.go freebsd_amd64 freebsd_arm64
-	GOOS=freebsd GOARCH=arm64 go test -c -o /dev/null
-
-# 3900x/qemu
-freebsd_386:
-	@echo "Should be executed only on freebsd/386."
-	go generate 2>&1 | tee log-generate
-	go test -c -o /dev/null
-
-# 3900x/qemu
-freebsd_arm:
-	@echo "Should be executed only on freebsd/arm."
-	go generate 2>&1 | tee log-generate
-	go test -c -o /dev/null
-
-# 3900x
-linux_amd64:
-	@echo "Should be executed only on linux/amd64."
-	go generate 2>&1 | tee log-generate
-	go test -c -o /dev/null
-
-# 3900x
-linux_386:
-	@echo "Should be executed only on linux/amd64."
-	CCGO_CPP=i686-linux-gnu-cpp TARGET_GOARCH=386 TARGET_GOOS=linux go generate 2>&1 | tee log-generate
-	GOOS=linux GOARCH=386 go test -c -o /dev/null
-
-# 3900x
-linux_arm:
-	@echo "Should be executed only on linux/amd64."
-	CCGO_CPP=arm-linux-gnueabi-cpp TARGET_GOARCH=arm TARGET_GOOS=linux go generate 2>&1 | tee log-generate
-	GOOS=linux GOARCH=arm go test -c -o /dev/null
-
-# 3900x
-linux_arm64:
-	@echo "Should be executed only on linux/amd64."
-	CCGO_CPP=aarch64-linux-gnu-cpp TARGET_GOARCH=arm64 TARGET_GOOS=linux go generate 2>&1 | tee log-generate
-	GOOS=linux GOARCH=arm64 go test -c -o /dev/null
-
-# 3900x
-linux_ppc64le:
-	@echo "Should be executed only on linux/amd64."
-	CCGO_CPP=powerpc64le-linux-gnu-cpp TARGET_GOARCH=ppc64le TARGET_GOOS=linux go generate 2>&1 | tee log-generate
-	GOOS=linux GOARCH=ppc64le go test -c -o /dev/null
-
-# linux/riscv64
-linux_riscv64:
-	@echo "Should be executed only on linux/amd64."
-	CCGO_CPP=riscv64-linux-gnu-cpp TARGET_GOARCH=riscv64 TARGET_GOOS=linux go generate 2>&1 | tee log-generate
-	GOOS=linux GOARCH=riscv64 go test -c -o /dev/null
-
-# 3900x
-linux_s390x:
-	@echo "Should be executed only on linux/amd64."
-	CCGO_CPP=s390x-linux-gnu-cpp TARGET_GOARCH=s390x TARGET_GOOS=linux go generate 2>&1 | tee log-generate
-	GOOS=linux GOARCH=s390x go test -c -o /dev/null
-
-# 3900x/qemu
-openbsd_amd64:
-	@echo "Should be executed only on openbsd/amd64."
-	go generate 2>&1 | tee log-generate
-	go test -c -o /dev/null
-
-# 3900x/qemu
-openbsd_arm64:
-	@echo "Should be executed only on openbsd/arm64."
-	GOGC=10 GOMEMLIMIT=6GiB go generate 2>&1 | tee log-generate
-	go test -c -o /dev/null
-
-generate_all_targets_on_linux_amd64: linux_amd64 linux_386 linux_arm linux_arm64 linux_s390x linux_ppc64le linux_riscv64 windows_amd64 windows_arm64 #TODO windows_386
-	gofmt -l -s -w .
+	GOOS=windows GOARCH=386 go build -v ./...
+	GOOS=windows GOARCH=amd64 go test -c -o /dev/null
+	GOOS=windows GOARCH=amd64 go build -v ./...
+	GOOS=windows GOARCH=arm64 go test -c -o /dev/null
+	GOOS=windows GOARCH=arm64 go build -v ./...
 	echo done
-
-tcl_test_wine:
-	GOOS=windows GOARCH=amd64 go build -o testfixture.exe modernc.org/sqlite/internal/testfixture
-
-run_tcl_test_wine:
-	TCL_LIBRARY=Z:/home/jnml/src/modernc.org/tcl/assets wine testfixture.exe ./testdata/tcl/zipfile.test
-
-extraquick:
-	go test -timeout 24h -v -failfast -suite extraquick -maxerror 1 2>&1 | tee log-extraquick
-	date
-
-full:
-	go test -timeout 24h -v -run Tcl -suite full 2>&1 | tee log-full
-	date
 
 clean:
+	rm -f log-* cpu.test mem.test *.out go.work* licgen
 	go clean
-	rm -f *~ *.test *.out test.db* tt4-test*.db* test_sv.* testdb-*
-
-cover:
-	t=$(shell tempfile) ; go test -coverprofile $$t && go tool cover -html $$t && unlink $$t
-
-cpu: clean
-	go test -run @ -bench . -cpuprofile cpu.out
-	go tool pprof -lines *.test cpu.out
 
 edit:
-	@touch log
-	@if [ -f "Session.vim" ]; then gvim -S & else gvim -p Makefile *.go & fi
+	@if [ -f "Session.vim" ]; then gvim -S & else gvim -p Makefile go.mod builder.json all_test.go & fi
 
 editor:
-	gofmt -l -s -w *.go
-	go install -v ./...
-	go test -c -o /dev/null -tags=cgo,cgotest
+	go test -c -o /dev/null
+	go build -v  -o /dev/null ./...
+	cd vendor_libs && go build -o /dev/null main.go stamp.go
+	cd licensegen && go build -tags none -o /dev/null .
 
-internalError:
-	egrep -ho '"internal error.*"' *.go | sort | cat -n
+# Regenerate LICENSE-3RD-PARTY.md, SBOM.md and the two machine-readable SBOMs
+# from the module graph and the vendored C. Run after any dependency bump or
+# re-vendoring. `./licgen -check` writes nothing and fails if any of the four
+# committed files is stale; that is the form for CI.
+licenses: sbom
 
-later:
-	@grep -n $(grep) LATER * || true
-	@grep -n $(grep) MAYBE * || true
+sbom:
+	cd licensegen && go build -tags none -o ../licgen .
+	./licgen
+	rm -f licgen
 
-mem: clean
-	go test -run @ -bench . -memprofile mem.out -memprofilerate 1 -timeout 24h
-	go tool pprof -lines -web -alloc_space *.test mem.out
+test:
+	go test -v -timeout 24h
 
-memgrind:
-	go test -v -timeout 24h -tags libc.memgrind,cgobench -bench . -suite extraquick -xtags=libc.memgrind
+# The whole suite through the pluggable page cache binding, with
+# modernc.org/sqlite/pcache registered. See pcachepool_test.go.
+test_pcache:
+	go test -v -timeout 24h -tags pcachepool
+	
+# The whole recipe runs on one Go toolchain, the one vendor.json records: gofmt
+# output differs between Go releases, so the toolchain is one of the inputs.
+# GOTOOLCHAIN=local makes a toolchain older than go.mod asks for an error
+# rather than a silent download for some steps and not others.
+vendor: export GOTOOLCHAIN := local
+vendor:
+	cd vendor_libs && go build -o ../vendor main.go stamp.go
+	# Before anything is touched: refuse a dirty checkout, two checkouts on
+	# different libc versions, or a libsqlite_vec built against another
+	# libsqlite3 than ../libsqlite3, and remember what was seen. See stamp.go.
+	./vendor -preflight -undup=$(UNDUP) $(VENDORFLAGS)
+	# Reconstruct full per-target files (a no-op the first time), so the freshly
+	# vendored transpiles overwrite a clean tree with no stale shared files.
+	go run $(UNDUP) -expand -dir lib
+	go run $(UNDUP) -expand -dir vec
+	# ../libsqlite3 and ../libsqlite_vec are read one full per-target file at a
+	# time. They ship expanded today, but either may adopt the deduplicated
+	# layout (modernc.org/builder's NW autogen); the tool detects that and
+	# expands a temporary copy, leaving those checkouts untouched. Hence the pin:
+	# one version of record for this repo, wherever undup is invoked.
+	./vendor -undup=$(UNDUP)
+	# Fold byte-identical declarations back into build-tagged shared files. undup
+	# only touches files carrying the generated-code marker, never hand-written
+	# platform files (libsqlite3_*.go, hooks_*.go, ...).
+	go run $(UNDUP) -dir lib
+	go run $(UNDUP) -dir vec
+	"$$(go env GOROOT)/bin/gofmt" -s -w lib/sqlite*.go vec/vec*.go
+	make build_all_targets
+	# Last, once everything above has succeeded: record the sources, the
+	# toolchain and a digest of the output in vendor.json, then check it.
+	./vendor -stamp -undup=$(UNDUP) $(VENDORFLAGS)
+	rm -f vendor
+	go test ./internal/vendorstamp/
 
-regression_base_release:
-	GO111MODULE=on go test -v -timeout 24h -tags=cgobench -run @ -bench '(Reading1|InsertComparative)/sqlite[^3]' -recs_per_sec_as_mbps 2>&1 | tee log-regression-base
-
-regression_base_master:
-	GO111MODULE=off go test -v -timeout 24h -tags=cgobench -run @ -bench '(Reading1|InsertComparative)/sqlite[^3]' -recs_per_sec_as_mbps 2>&1 | tee log-regression-base
-
-regression_check:
-	GO111MODULE=off go test -v -timeout 24h -tags=cgobench -run @ -bench '(Reading1|InsertComparative)/sqlite[^3]' -recs_per_sec_as_mbps 2>&1 | tee log-regression
-	benchcmp -changed -mag log-regression-base log-regression
-
-nuke: clean
-	go clean -i
-
-todo:
-	@grep -nr $(grep) ^[[:space:]]*_[[:space:]]*=[[:space:]][[:alpha:]][[:alnum:]]* * | grep -v $(ngrep) || true
-	@grep -nr $(grep) TODO * | grep -v $(ngrep) || true
-	@grep -nr $(grep) BUG * | grep -v $(ngrep) || true
-	@grep -nr $(grep) [^[:alpha:]]println * | grep -v $(ngrep) || true
+work:
+	rm -f go.work*
+	go work init
+	go work use .
+	go work use ../cc/v4
+	go work use ../ccgo/v3
+	go work use ../ccgo/v4
+	go work use ../libc
+	go work use ../libtcl8.6
+	go work use ../libsqlite3
+	go work use ../libz

@@ -15,6 +15,7 @@
     <img title="GitHub Workflow Status (test @ master)" src="https://img.shields.io/github/actions/workflow/status/lrstanley/girc/test.yml?branch=master&label=test&style=flat-square">
   </a>
 
+
   <a href="https://codecov.io/gh/lrstanley/girc">
     <img title="Code Coverage" src="https://img.shields.io/codecov/c/github/lrstanley/girc/master?style=flat-square">
   </a>
@@ -92,7 +93,10 @@ usecases/examples/projects which utilize girc:
 | --- | --- |
 | [nagios-check-ircd](https://github.com/lrstanley/nagios-check-ircd) | Nagios utility for monitoring the health of an ircd |
 | [nagios-notify-irc](https://github.com/lrstanley/nagios-notify-irc) | Nagios utility for sending alerts to one or many channels/networks |
-| [matterbridge](https://github.com/mspgeek-community/matterbridge) | bridge between mattermost, IRC, slack, discord (and many others) with REST API |
+| [matterbridge](https://github.com/42wim/matterbridge) | bridge between mattermost, IRC, slack, discord (and many others) with REST API |
+| [milla](https://github.com/terminaldweller/milla) | terminaldweller's irc chat bot |
+[ [circ](https://github.com/terminaldweller/circ) | a cli irc client |
+| [hii](https://github.com/nmeum/hii) | A file-based IRC client |
 
 Working on a project and want to add it to the list? Submit a pull request!
 
@@ -145,7 +149,7 @@ Working on a project and want to add it to the list? Submit a pull request!
 ```
 MIT License
 
-Copyright (c) 2016 Liam Stanley <me@liamstanley.io>
+Copyright (c) 2016 Liam Stanley <liam@liam.sh>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

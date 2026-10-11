@@ -17,12 +17,13 @@ type options struct {
 	enqueueTimeout          time.Duration
 	shutdownTimeout         time.Duration
 	flushTimeout            time.Duration
-	useSyncMapLevelCache    bool
+	useArrayLevelCache      bool
 	maxPooledBuffer         int
 	disableBufferPool       bool
 	metricsCollector        MetricsCollector
 	metricsUpdateFreqMillis int64
 	stackFilter             map[string]struct{}
+	maxFieldLen             int
 }
 
 // MaxQueueSize is the maximum number of log records that can be queued.
@@ -76,7 +77,7 @@ func OnTargetQueueFull(f func(target Target, rec *LogRec, maxQueueSize int) bool
 }
 
 // OnExit, when not nil, is called when a FatalXXX style log API is called.
-// When nil, then the default behavior is to cleanly shut down this Logr and
+// When nil, the default behavior is to cleanly shut down this Logr and
 // call `os.Exit(code)`.
 func OnExit(f func(code int)) Option {
 	return func(l *Logr) error {
@@ -86,7 +87,7 @@ func OnExit(f func(code int)) Option {
 }
 
 // OnPanic, when not nil, is called when a PanicXXX style log API is called.
-// When nil, then the default behavior is to cleanly shut down this Logr and
+// When nil, the default behavior is to cleanly shut down this Logr and
 // call `panic(err)`.
 func OnPanic(f func(err interface{})) Option {
 	return func(l *Logr) error {
@@ -125,12 +126,28 @@ func FlushTimeout(dur time.Duration) Option {
 	}
 }
 
-// UseSyncMapLevelCache can be set to true when high concurrency (e.g. >32 cores)
-// is expected. This may improve performance with large numbers of cores - benchmark
-// for your use case.
+// UseArrayLevelCache can be set to true to use the legacy array-based level cache
+// instead of the default sync.Map implementation. The sync.Map cache is recommended
+// for most use cases as it provides better performance (lock-free reads) and memory
+// efficiency (sparse allocation). The array cache allocates 524KB upfront regardless
+// of level usage.
+// Deprecated: This option exists for backward compatibility. The sync.Map cache is
+// preferred for production use.
+func UseArrayLevelCache(use bool) Option {
+	return func(l *Logr) error {
+		l.options.useArrayLevelCache = use
+		return nil
+	}
+}
+
+// UseSyncMapLevelCache is deprecated. The sync.Map level cache is now the default.
+// This function is kept for backward compatibility and does nothing.
+// To use the legacy array cache, use UseArrayLevelCache(true) instead.
+// Deprecated: Use UseArrayLevelCache(false) or omit this option entirely.
 func UseSyncMapLevelCache(use bool) Option {
 	return func(l *Logr) error {
-		l.options.useSyncMapLevelCache = use
+		// Invert the logic to maintain backward compatibility
+		l.options.useArrayLevelCache = !use
 		return nil
 	}
 }
@@ -187,6 +204,19 @@ func StackFilter(pkg ...string) Option {
 				l.options.stackFilter[p] = struct{}{}
 			}
 		}
+		return nil
+	}
+}
+
+// MaxFieldLen is the maximum number of characters for a field.
+// If exceeded, remaining bytes will be discarded.
+// Defaults to DefaultMaxFieldLength.
+func MaxFieldLen(size int) Option {
+	return func(l *Logr) error {
+		if size < 0 {
+			return errors.New("size cannot be less than zero")
+		}
+		l.options.maxFieldLen = size
 		return nil
 	}
 }

@@ -4,6 +4,7 @@
 package bwhatsapp
 
 import (
+	"context"
 	"fmt"
 	"mime"
 	"strings"
@@ -151,9 +152,9 @@ func (b *Bwhatsapp) handleTextMessage(messageInfo types.MessageInfo, msg *proto.
 			senderJID = types.NewJID(ci.GetParticipant(), types.DefaultUserServer)
 		}
 
-		if ci.MentionedJid != nil {
+		if ci.MentionedJID != nil {
 			// handle user mentions
-			for _, mentionedJID := range ci.MentionedJid {
+			for _, mentionedJID := range ci.MentionedJID {
 				numberAndSuffix := strings.SplitN(mentionedJID, "@", 2)
 
 				// mentions comes as telephone numbers and we don't want to expose it to other bridges
@@ -241,7 +242,7 @@ func (b *Bwhatsapp) handleImageMessage(msg *events.Message) {
 
 	b.Log.Debugf("Trying to download %s with type %s", filename, imsg.GetMimetype())
 
-	data, err := b.wc.Download(imsg)
+	data, err := b.wc.Download(context.TODO(), imsg)
 	if err != nil {
 		b.Log.Errorf("Download image failed: %s", err)
 
@@ -308,7 +309,7 @@ func (b *Bwhatsapp) handleVideoMessage(msg *events.Message) {
 
 	b.Log.Debugf("Trying to download %s with size %#v and type %s", filename, imsg.GetFileLength(), imsg.GetMimetype())
 
-	data, err := b.wc.Download(imsg)
+	data, err := b.wc.Download(context.TODO(), imsg)
 	if err != nil {
 		b.Log.Errorf("Download video failed: %s", err)
 
@@ -365,7 +366,7 @@ func (b *Bwhatsapp) handleAudioMessage(msg *events.Message) {
 
 	b.Log.Debugf("Trying to download %s with size %#v and type %s", filename, imsg.GetFileLength(), imsg.GetMimetype())
 
-	data, err := b.wc.Download(imsg)
+	data, err := b.wc.Download(context.TODO(), imsg)
 	if err != nil {
 		b.Log.Errorf("Download video failed: %s", err)
 
@@ -419,7 +420,7 @@ func (b *Bwhatsapp) handleDocumentMessage(msg *events.Message) {
 
 	b.Log.Debugf("Trying to download %s with extension %s and type %s", filename, fileExt, imsg.GetMimetype())
 
-	data, err := b.wc.Download(imsg)
+	data, err := b.wc.Download(context.TODO(), imsg)
 	if err != nil {
 		b.Log.Errorf("Download document message failed: %s", err)
 
@@ -441,10 +442,10 @@ func (b *Bwhatsapp) handleDelete(messageInfo *proto.ProtocolMessage) {
 	rmsg := config.Message{
 		Account:  b.Account,
 		Protocol: b.Protocol,
-		ID:       getMessageIdFormat(sender, *messageInfo.Key.Id),
+		ID:       getMessageIdFormat(sender, *messageInfo.Key.ID),
 		Event:    config.EventMsgDelete,
 		Text:     config.EventMsgDelete,
-		Channel:  *messageInfo.Key.RemoteJid,
+		Channel:  *messageInfo.Key.RemoteJID,
 	}
 
 	b.Log.Debugf("<= Sending message from %s to gateway", b.Account)

@@ -79,7 +79,7 @@ type gelfRecord struct {
 func (gr gelfRecord) MarshalJSONObject(enc *gojay.Encoder) {
 	enc.AddStringKey(GelfVersionKey, GelfVersion)
 	enc.AddStringKey(GelfHostKey, gr.getHostname())
-	enc.AddStringKey(GelfShortKey, gr.Msg())
+	enc.AddStringKey(GelfShortKey, gr.safeMsg("-")) // Gelf requires a non-empty `short_message`
 
 	if gr.level.Stacktrace {
 		frames := gr.StackFrames()
@@ -104,7 +104,7 @@ func (gr gelfRecord) MarshalJSONObject(enc *gojay.Encoder) {
 		caller := logr.Field{
 			Key:    "_caller",
 			Type:   logr.StringType,
-			String: gr.LogRec.Caller(),
+			String: gr.Caller(),
 		}
 		fields = append(fields, caller)
 	}
@@ -116,7 +116,7 @@ func (gr gelfRecord) MarshalJSONObject(enc *gojay.Encoder) {
 
 	if len(fields) > 0 {
 		for _, field := range fields {
-			if !strings.HasPrefix("_", field.Key) {
+			if !strings.HasPrefix(field.Key, "_") {
 				field.Key = "_" + field.Key
 			}
 			if err := encodeField(enc, field); err != nil {
@@ -129,6 +129,15 @@ func (gr gelfRecord) MarshalJSONObject(enc *gojay.Encoder) {
 // IsNil returns true if the gelf record pointer is nil.
 func (gr gelfRecord) IsNil() bool {
 	return gr.LogRec == nil
+}
+
+// safeMsg returns the log record Message field or an alternate string when msg is empty.
+func (gr gelfRecord) safeMsg(alt string) string {
+	s := gr.Msg()
+	if s == "" {
+		s = alt
+	}
+	return s
 }
 
 func (g *Gelf) getHostname() string {
@@ -145,7 +154,7 @@ func (g *Gelf) getHostname() string {
 	if err != nil {
 		return "unknown"
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	local := conn.LocalAddr().(*net.UDPAddr)
 	return local.IP.String()

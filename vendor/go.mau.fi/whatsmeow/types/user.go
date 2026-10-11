@@ -9,13 +9,22 @@ package types
 import (
 	"time"
 
-	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/util/exslices"
+	"go.mau.fi/util/jsontime"
+
+	"go.mau.fi/whatsmeow/proto/waVnameCert"
 )
 
 // VerifiedName contains verified WhatsApp business details.
 type VerifiedName struct {
-	Certificate *waProto.VerifiedNameCertificate
-	Details     *waProto.VerifiedNameCertificate_Details
+	Certificate *waVnameCert.VerifiedNameCertificate
+	Details     *waVnameCert.VerifiedNameCertificate_Details
+
+	VerifiedLevel string
+	Version       int
+	HostStorage   int
+	ActualActors  int
+	PrivacyModeTS time.Time
 }
 
 // UserInfo contains info about a WhatsApp user.
@@ -24,15 +33,41 @@ type UserInfo struct {
 	Status       string
 	PictureID    string
 	Devices      []JID
+	LID          JID
+}
+
+type BotListInfo struct {
+	BotJID    JID
+	PersonaID string
+}
+
+type BotProfileInfo struct {
+	JID                 JID
+	Name                string
+	Attributes          string
+	Description         string
+	Category            string
+	IsDefault           bool
+	Prompts             []string
+	PersonaID           string
+	Commands            []BotProfileCommand
+	CommandsDescription string
+}
+
+type BotProfileCommand struct {
+	Name        string
+	Description string
 }
 
 // ProfilePictureInfo contains the ID and URL for a WhatsApp user's profile picture or group's photo.
 type ProfilePictureInfo struct {
-	URL  string // The full URL for the image, can be downloaded with a simple HTTP request.
-	ID   string // The ID of the image. This is the same as UserInfo.PictureID.
-	Type string // The type of image. Known types include "image" (full res) and "preview" (thumbnail).
+	URL  string `json:"url"`  // The full URL for the image, can be downloaded with a simple HTTP request.
+	ID   string `json:"id"`   // The ID of the image. This is the same as UserInfo.PictureID.
+	Type string `json:"type"` // The type of image. Known types include "image" (full res) and "preview" (thumbnail).
 
-	DirectPath string // The path to the image, probably not very useful
+	DirectPath string `json:"direct_path"` // The path to the image, probably not very useful
+
+	Hash []byte `json:"hash"` // Some kind of hash (format is unknown)
 }
 
 // ContactInfo contains the cached names of a WhatsApp user.
@@ -43,6 +78,8 @@ type ContactInfo struct {
 	FullName     string
 	PushName     string
 	BusinessName string
+	// Only for LID members encountered in groups, the phone number in the form "+1∙∙∙∙∙∙∙∙80"
+	RedactedPhone string
 }
 
 // LocalChatSettings contains the cached local settings for a chat.
@@ -59,6 +96,8 @@ type IsOnWhatsAppResponse struct {
 	Query string // The query string used
 	JID   JID    // The canonical user ID
 	IsIn  bool   // Whether the phone is registered or not.
+
+	PhoneNumber JID
 
 	VerifiedName *VerifiedName // If the phone is a business, the verified business details.
 }
@@ -87,19 +126,46 @@ type PrivacySetting string
 
 // Possible privacy setting values.
 const (
-	PrivacySettingUndefined PrivacySetting = ""
-	PrivacySettingAll       PrivacySetting = "all"
-	PrivacySettingContacts  PrivacySetting = "contacts"
-	PrivacySettingNone      PrivacySetting = "none"
+	PrivacySettingUndefined        PrivacySetting = ""
+	PrivacySettingAll              PrivacySetting = "all"
+	PrivacySettingContacts         PrivacySetting = "contacts"
+	PrivacySettingContactAllowlist PrivacySetting = "contact_allowlist"
+	PrivacySettingContactBlacklist PrivacySetting = "contact_blacklist"
+	PrivacySettingMatchLastSeen    PrivacySetting = "match_last_seen"
+	PrivacySettingKnown            PrivacySetting = "known"
+	PrivacySettingNone             PrivacySetting = "none"
+	PrivacySettingOnStandard       PrivacySetting = "on_standard"
+	PrivacySettingOff              PrivacySetting = "off"
+)
+
+// PrivacySettingType is the type of privacy setting.
+type PrivacySettingType string
+
+const (
+	PrivacySettingTypeGroupAdd     PrivacySettingType = "groupadd"     // Valid values: PrivacySettingAll, PrivacySettingContacts, PrivacySettingContactBlacklist, PrivacySettingNone
+	PrivacySettingTypeLastSeen     PrivacySettingType = "last"         // Valid values: PrivacySettingAll, PrivacySettingContacts, PrivacySettingContactBlacklist, PrivacySettingNone
+	PrivacySettingTypeStatus       PrivacySettingType = "status"       // Valid values: PrivacySettingAll, PrivacySettingContacts, PrivacySettingContactBlacklist, PrivacySettingNone
+	PrivacySettingTypeProfile      PrivacySettingType = "profile"      // Valid values: PrivacySettingAll, PrivacySettingContacts, PrivacySettingContactBlacklist, PrivacySettingNone
+	PrivacySettingTypeReadReceipts PrivacySettingType = "readreceipts" // Valid values: PrivacySettingAll, PrivacySettingNone
+	PrivacySettingTypeOnline       PrivacySettingType = "online"       // Valid values: PrivacySettingAll, PrivacySettingMatchLastSeen
+	PrivacySettingTypeCallAdd      PrivacySettingType = "calladd"      // Valid values: PrivacySettingAll, PrivacySettingKnown
+	PrivacySettingTypeMessages     PrivacySettingType = "messages"     // Valid values: PrivacySettingAll, PrivacySettingContacts
+	PrivacySettingTypeDefense      PrivacySettingType = "defense"      // Valid values: PrivacySettingOnStandard, PrivacySettingOff
+	PrivacySettingTypeStickers     PrivacySettingType = "stickers"     // Valid values: PrivacySettingContacts, PrivacySettingContactAllowlist, PrivacySettingNone
 )
 
 // PrivacySettings contains the user's privacy settings.
 type PrivacySettings struct {
-	GroupAdd     PrivacySetting
-	LastSeen     PrivacySetting
-	Status       PrivacySetting
-	Profile      PrivacySetting
-	ReadReceipts PrivacySetting
+	GroupAdd     PrivacySetting // Valid values: PrivacySettingAll, PrivacySettingContacts, PrivacySettingContactBlacklist, PrivacySettingNone
+	LastSeen     PrivacySetting // Valid values: PrivacySettingAll, PrivacySettingContacts, PrivacySettingContactBlacklist, PrivacySettingNone
+	Status       PrivacySetting // Valid values: PrivacySettingAll, PrivacySettingContacts, PrivacySettingContactBlacklist, PrivacySettingNone
+	Profile      PrivacySetting // Valid values: PrivacySettingAll, PrivacySettingContacts, PrivacySettingContactBlacklist, PrivacySettingNone
+	ReadReceipts PrivacySetting // Valid values: PrivacySettingAll, PrivacySettingNone
+	CallAdd      PrivacySetting // Valid values: PrivacySettingAll, PrivacySettingKnown
+	Online       PrivacySetting // Valid values: PrivacySettingAll, PrivacySettingMatchLastSeen
+	Messages     PrivacySetting // Valid values: PrivacySettingAll, PrivacySettingContacts
+	Defense      PrivacySetting // Valid values: PrivacySettingOnStandard, PrivacySettingOff
+	Stickers     PrivacySetting // Valid values: PrivacySettingContacts, PrivacySettingContactAllowlist, PrivacySettingNone
 }
 
 // StatusPrivacyType is the type of list in StatusPrivacy.
@@ -120,4 +186,68 @@ type StatusPrivacy struct {
 	List []JID
 
 	IsDefault bool
+}
+
+type SetStatusEmoji struct {
+	Content string `json:"content"`
+}
+
+type SetStatusInput struct {
+	Text     *string          `json:"text"`
+	Emoji    *SetStatusEmoji  `json:"emoji,omitempty"`
+	Duration jsontime.Seconds `json:"ephemeral_duration_sec"`
+}
+
+type BlocklistItem struct {
+	LID    JID
+	PN     JID
+	Active bool
+}
+
+// Blocklist contains the user's current list of blocked users.
+type Blocklist struct {
+	AddressingMode AddressingMode
+
+	DHash string // TODO is this just a timestamp?
+	Items []BlocklistItem
+}
+
+func (bl *Blocklist) LIDs() []JID {
+	return exslices.CastFunc[JID](bl.Items, func(item BlocklistItem) JID {
+		return item.LID
+	})
+}
+
+func (bl *Blocklist) IsBlocked(jid JID) bool {
+	for _, item := range bl.Items {
+		if item.LID == jid || item.PN == jid {
+			return true
+		}
+	}
+	return false
+}
+
+// BusinessHoursConfig contains business operating hours of a WhatsApp business.
+type BusinessHoursConfig struct {
+	DayOfWeek string
+	Mode      string
+	OpenTime  string
+	CloseTime string
+}
+
+// Category contains a WhatsApp business category.
+type Category struct {
+	ID   string
+	Name string
+}
+
+// BusinessProfile contains the profile information of a WhatsApp business.
+type BusinessProfile struct {
+	JID                   JID
+	Address               string
+	Email                 string
+	Categories            []Category
+	ProfileOptions        map[string]string
+	BusinessHoursTimeZone string
+	BusinessHours         []BusinessHoursConfig
 }

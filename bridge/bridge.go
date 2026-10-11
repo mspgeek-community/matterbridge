@@ -74,7 +74,7 @@ func (b *Bridge) SetChannelMembers(newMembers *config.ChannelMembers) {
 func (b *Bridge) joinChannels(channels map[string]config.ChannelInfo, exists map[string]bool) error {
 	for ID, channel := range channels {
 		if !exists[ID] {
-			b.Log.Infof("%s: joining %s (ID: %s)", b.Account, channel.Name, ID)
+			b.Log.Debugf("%s: joining %s (ID: %s)", b.Account, channel.Name, ID)
 			time.Sleep(time.Duration(b.GetInt("JoinDelay")) * time.Millisecond)
 			err := b.JoinChannel(channel)
 			if err != nil {
@@ -91,10 +91,18 @@ func (b *Bridge) GetConfigKey(key string) string {
 }
 
 func (b *Bridge) IsKeySet(key string) bool {
+	if b.Config == nil {
+		return false
+	}
 	return b.Config.IsKeySet(b.GetConfigKey(key)) || b.Config.IsKeySet("general."+key)
 }
 
 func (b *Bridge) GetBool(key string) bool {
+	// A bridge disabled after a failed start has no config, but goroutines
+	// it started may still call this.
+	if b.Config == nil {
+		return false
+	}
 	val, ok := b.Config.GetBool(b.GetConfigKey(key))
 	if !ok {
 		val, _ = b.Config.GetBool("general." + key)
@@ -103,6 +111,9 @@ func (b *Bridge) GetBool(key string) bool {
 }
 
 func (b *Bridge) GetInt(key string) int {
+	if b.Config == nil {
+		return 0
+	}
 	val, ok := b.Config.GetInt(b.GetConfigKey(key))
 	if !ok {
 		val, _ = b.Config.GetInt("general." + key)
@@ -111,6 +122,9 @@ func (b *Bridge) GetInt(key string) int {
 }
 
 func (b *Bridge) GetString(key string) string {
+	if b.Config == nil {
+		return ""
+	}
 	val, ok := b.Config.GetString(b.GetConfigKey(key))
 	if !ok {
 		val, _ = b.Config.GetString("general." + key)
@@ -119,6 +133,9 @@ func (b *Bridge) GetString(key string) string {
 }
 
 func (b *Bridge) GetStringSlice(key string) []string {
+	if b.Config == nil {
+		return nil
+	}
 	val, ok := b.Config.GetStringSlice(b.GetConfigKey(key))
 	if !ok {
 		val, _ = b.Config.GetStringSlice("general." + key)
@@ -127,6 +144,9 @@ func (b *Bridge) GetStringSlice(key string) []string {
 }
 
 func (b *Bridge) GetStringSlice2D(key string) [][]string {
+	if b.Config == nil {
+		return nil
+	}
 	val, ok := b.Config.GetStringSlice2D(b.GetConfigKey(key))
 	if !ok {
 		val, _ = b.Config.GetStringSlice2D("general." + key)

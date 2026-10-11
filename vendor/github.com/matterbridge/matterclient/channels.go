@@ -1,282 +1,1035 @@
 package matterclient
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
-	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost/server/public/model"
 )
+
+func (m *Client) CreateChannel(ctx context.Context, teamID string, channelName string, channelType model.ChannelType) (*model.Channel, error) {
+	if channelType == "" {
+		channelType = model.ChannelTypeOpen
+	}
+
+	m.Users.mu.RLock()
+
+	// Check existing channelData cache first
+	for _, ch := range m.Users.channelData {
+		if ch.TeamId == teamID && ch.Name == channelName {
+			m.Users.mu.RUnlock()
+			return ch, nil
+		}
+	}
+
+	m.Users.mu.RUnlock()
+
+	// Fallback to creating the channel via REST API
+	channelReq := &model.Channel{
+		Name:        channelName,
+		DisplayName: channelName,
+		Type:        channelType,
+		TeamId:      teamID,
+	}
+
+	retryCount := 0
+	for {
+		m.apiLogger.Warnf("CreateChannel: CreateChannel for %s #%d", channelName, retryCount)
+
+		mmchannel, resp, err := m.Client.CreateChannel(ctx, channelReq)
+		if err == nil {
+			// Cache it so subsequent GetChannel calls are fast
+			m.Users.mu.Lock()
+			m.Users.channelData[mmchannel.Id] = mmchannel
+			m.Users.mu.Unlock()
+
+			return mmchannel, nil
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "CreateChannel", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+			continue
+		}
+
+		m.logger.Errorf("CreateChannel failed for %s: %v", channelName, err)
+
+		return nil, err
+	}
+}
+
+func (m *Client) CreateDirectChannel(ctx context.Context, userID1, userID2 string) (*model.Channel, error) {
+	dmName := model.GetDMNameFromIds(userID1, userID2)
+
+	m.Users.mu.RLock()
+
+	// Check existing channelData cache first
+	for _, ch := range m.Users.channelData {
+		if ch.Type == model.ChannelTypeDirect && ch.Name == dmName {
+			m.Users.mu.RUnlock()
+			return ch, nil
+		}
+	}
+
+	m.Users.mu.RUnlock()
+
+	// Fallback to REST API
+	retryCount := 0
+	for {
+		m.apiLogger.Warnf("CreateDirectChannel for users %s and %s (%s) #%d", userID1, userID2, dmName, retryCount)
+
+		mmchannel, resp, err := m.Client.CreateDirectChannel(ctx, userID1, userID2)
+		if err == nil {
+			// Cache the DM channel so GetChannel is fast
+			m.Users.mu.Lock()
+			m.Users.channelData[mmchannel.Id] = mmchannel
+			m.Users.mu.Unlock()
+
+			return mmchannel, nil
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "CreateDirectChannel", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+			continue
+		}
+
+		m.logger.Errorf("CreateDirectChannel failed for %s, %s (%s): %v", userID1, userID2, dmName, err)
+
+		return nil, err
+	}
+}
+
+// GetCachedChannel returns the channel from local cache without triggering a REST API lookup.
+func (m *Client) GetCachedChannel(channelID string) *model.Channel {
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
+
+	return m.Users.channelData[channelID]
+}
+
+// GetCachedChannelName returns the normalised channel name if cached, or empty string.
+func (m *Client) GetCachedChannelName(channelID string) string {
+	// getNormalisedName reads the users/channels caches, which are modified concurrently.
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
+
+	if ch := m.Users.channelData[channelID]; ch != nil {
+		return m.getNormalisedName(ch)
+	}
+
+	return ""
+}
+
+// GetCachedChannelID returns the channel ID for a channel name and team ID from cache.
+func (m *Client) GetCachedChannelID(channelName, teamID string) string {
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
+
+	for _, ch := range m.Users.channelData {
+		if (ch.TeamId == teamID || ch.Type == model.ChannelTypeGroup) && (ch.Name == channelName || (ch.Type == model.ChannelTypeGroup && m.getNormalisedName(ch) == channelName)) {
+			return ch.Id
+		}
+	}
+
+	return ""
+}
+
+// GetCachedDirectChannelID returns the channel ID for a DM with the given username from cache.
+func (m *Client) GetCachedDirectChannelID(username string) string {
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
+
+	var targetUser *model.User
+
+	for _, u := range m.Users.users {
+		if u.Username == username {
+			targetUser = u
+			break
+		}
+	}
+
+	if targetUser == nil {
+		return ""
+	}
+
+	dmName := m.GetDMChannelName(m.User.Id, targetUser.Id)
+	for _, ch := range m.Users.channelData {
+		if ch.Type == model.ChannelTypeDirect && ch.Name == dmName {
+			return ch.Id
+		}
+	}
+
+	return ""
+}
+
+func (m *Client) GetChannel(ctx context.Context, channelID string) *model.Channel {
+	m.Users.mu.RLock()
+	ch, exists := m.Users.channelData[channelID]
+	m.Users.mu.RUnlock()
+
+	if exists {
+		return ch
+	}
+
+	query := "/channels/" + channelID
+	retryCount := 0
+
+	for {
+		m.apiLogger.Warnf("GetChannel: DoAPIGet: query %s #%d", query, retryCount)
+		resp, err := m.Client.DoAPIGet(ctx, query, "")
+
+		if err == nil {
+			var summary ChannelSummary
+
+			decodeErr := json.NewDecoder(resp.Body).Decode(&summary)
+			resp.Body.Close()
+
+			if decodeErr == nil {
+				mmchannel := &model.Channel{
+					Id:          summary.Id,
+					UpdateAt:    summary.UpdateAt,
+					DeleteAt:    summary.DeleteAt,
+					TeamId:      summary.TeamId,
+					Type:        model.ChannelType(summary.Type),
+					DisplayName: summary.DisplayName,
+					Name:        summary.Name,
+					Header:      summary.Header,
+					Purpose:     summary.Purpose,
+					LastPostAt:  summary.LastPostAt,
+					CreatorId:   summary.CreatorId,
+				}
+
+				m.Users.mu.Lock()
+				m.Users.channelData[channelID] = mmchannel
+				m.Users.mu.Unlock()
+
+				return mmchannel
+			}
+
+			m.logger.Errorf("GetChannel decode failed for %s: %v", channelID, decodeErr)
+
+			return nil
+		}
+
+		var mResp *model.Response
+		if resp != nil {
+			mResp = model.BuildResponse(resp)
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "GetChannel", err, retryCount, 10, mResp)
+
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+
+		if hErr == nil && shouldRetry {
+			retryCount++
+
+			continue
+		}
+
+		m.logger.Errorf("GetChannel failed for %s: %v", channelID, err)
+
+		return nil
+	}
+}
+
+// GetChannelCount returns the number of active joined channels for the current user.
+func (m *Client) GetChannelCount() int {
+	if m == nil || m.Users == nil {
+		return 0
+	}
+
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
+
+	var count int
+
+	for id, ch := range m.Users.channelData {
+		if ch.DeleteAt != 0 {
+			continue
+		}
+
+		if _, joined := m.Users.joinedChannels[id]; joined {
+			count++
+		}
+	}
+
+	return count
+}
 
 // GetChannels returns all channels we're members off
 func (m *Client) GetChannels() []*model.Channel {
-	m.RLock()
-	defer m.RUnlock()
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
 
-	var channels []*model.Channel
-	// our primary team channels first
-	channels = append(channels, m.Team.Channels...)
-
-	for _, t := range m.OtherTeams {
-		if t.ID != m.Team.ID {
-			channels = append(channels, t.Channels...)
+	channels := make([]*model.Channel, 0, len(m.Users.joinedChannels))
+	for id := range m.Users.joinedChannels {
+		if ch, exists := m.Users.channelData[id]; exists {
+			channels = append(channels, ch)
 		}
 	}
 
 	return channels
 }
 
-func (m *Client) GetChannelHeader(channelID string) string {
-	m.RLock()
-	defer m.RUnlock()
-
-	for _, t := range m.OtherTeams {
-		for _, channel := range append(t.Channels, t.MoreChannels...) {
-			if channel.Id == channelID {
-				return channel.Header
-			}
-		}
+func (m *Client) GetChannelHeader(ctx context.Context, channelID string) string {
+	if ch := m.GetChannel(ctx, channelID); ch != nil {
+		return ch.Header
 	}
-
 	return ""
 }
 
-func getNormalisedName(channel *model.Channel) string {
+func (m *Client) getNormalisedName(channel *model.Channel) string {
 	if channel.Type == model.ChannelTypeGroup {
-		res := strings.ReplaceAll(channel.DisplayName, ", ", "-")
-		res = strings.ReplaceAll(res, " ", "_")
+		if channel.DisplayName != "" {
+			res := strings.ReplaceAll(channel.DisplayName, ", ", "-")
+			res = strings.ReplaceAll(res, " ", "_")
 
-		return res
+			return res
+		}
+
+		if groupName := m.getGroupChannelName(channel.Id); groupName != "" {
+			return groupName
+		}
 	}
 
 	return channel.Name
 }
 
-func (m *Client) GetChannelID(name string, teamID string) string {
-	m.RLock()
-	defer m.RUnlock()
-
+func (m *Client) GetChannelID(ctx context.Context, name string, teamID string) string {
 	if teamID != "" {
-		return m.getChannelIDTeam(name, teamID)
+		return m.getChannelIDTeam(ctx, name, teamID)
 	}
 
-	for _, t := range m.OtherTeams {
-		for _, channel := range append(t.Channels, t.MoreChannels...) {
-			if getNormalisedName(channel) == name {
-				return channel.Id
-			}
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
+
+	for _, ch := range m.Users.channelData {
+		if ch.Name == name || (ch.Type == model.ChannelTypeGroup && m.getNormalisedName(ch) == name) {
+			return ch.Id
 		}
 	}
 
 	return ""
 }
 
-func (m *Client) getChannelIDTeam(name string, teamID string) string {
-	for _, t := range m.OtherTeams {
-		if t.ID == teamID {
-			for _, channel := range append(t.Channels, t.MoreChannels...) {
-				if getNormalisedName(channel) == name {
-					return channel.Id
-				}
-			}
-		}
-	}
-
-	// Fallback if it's not found in the t.Channels or t.MoreChannels cache.
-	// This also let's us join private channels.
-	channel, _, err := m.Client.GetChannelByName(name, teamID, "")
-	if err != nil {
-		return ""
-	}
-
-	return channel.Id
-}
-
-func (m *Client) GetChannelName(channelID string) string {
-	m.RLock()
-	defer m.RUnlock()
-
-	for _, t := range m.OtherTeams {
-		if t == nil {
+func (m *Client) getChannelIDTeam(ctx context.Context, name string, teamID string) string {
+	m.Users.mu.RLock()
+	for _, ch := range m.Users.channelData {
+		if ch.TeamId != teamID && ch.Type != model.ChannelTypeDirect && ch.Type != model.ChannelTypeGroup {
 			continue
 		}
 
-		for _, channel := range append(t.Channels, t.MoreChannels...) {
-			if channel.Id == channelID {
-				return getNormalisedName(channel)
+		// Check raw channel name first
+		if strings.EqualFold(ch.Name, name) {
+			m.Users.mu.RUnlock()
+
+			return ch.Id
+		}
+
+		// Check normalized name only if type is group
+		if ch.Type == model.ChannelTypeGroup {
+			if strings.EqualFold(m.getNormalisedName(ch), name) {
+				m.Users.mu.RUnlock()
+
+				return ch.Id
+			}
+
+			// Renamed Group DM fallback: match by member usernames
+			groupName := m.getGroupChannelName(ch.Id)
+			if groupName != "" && strings.EqualFold(groupName, name) {
+				m.Users.mu.RUnlock()
+
+				return ch.Id
 			}
 		}
 	}
+	m.Users.mu.RUnlock()
 
-	return ""
-}
-
-func (m *Client) GetChannelTeamID(id string) string {
-	m.RLock()
-	defer m.RUnlock()
-
-	for _, t := range append(m.OtherTeams, m.Team) {
-		for _, channel := range append(t.Channels, t.MoreChannels...) {
-			if channel.Id == id {
-				return channel.TeamId
-			}
-		}
-	}
-
-	return ""
-}
-
-func (m *Client) GetLastViewedAt(channelID string) int64 {
-	m.RLock()
-	defer m.RUnlock()
+	query := "/teams/" + teamID + "/channels/name/" + name
+	retryCount := 0
 
 	for {
-		res, resp, err := m.Client.GetChannelMember(channelID, m.User.Id, "")
+		m.apiLogger.Warnf("getChannelIDTeam: DoAPIGet: query %s #%d", query, retryCount)
+		resp, err := m.Client.DoAPIGet(ctx, query, "")
+
 		if err == nil {
-			return res.LastViewedAt
+			var summary ChannelSummary
+
+			decodeErr := json.NewDecoder(resp.Body).Decode(&summary)
+			resp.Body.Close()
+
+			if decodeErr == nil {
+				channel := &model.Channel{
+					Id:          summary.Id,
+					UpdateAt:    summary.UpdateAt,
+					DeleteAt:    summary.DeleteAt,
+					TeamId:      summary.TeamId,
+					Type:        model.ChannelType(summary.Type),
+					DisplayName: summary.DisplayName,
+					Name:        summary.Name,
+					Header:      summary.Header,
+					Purpose:     summary.Purpose,
+					LastPostAt:  summary.LastPostAt,
+					CreatorId:   summary.CreatorId,
+				}
+
+				m.Users.mu.Lock()
+				m.Users.channelData[channel.Id] = channel
+				m.Users.mu.Unlock()
+
+				return channel.Id
+			}
+
+			m.logger.Errorf("getChannelIDTeam decode failed for %s: %v", name, decodeErr)
+
+			return ""
 		}
 
-		if err := m.HandleRatelimit("GetChannelMember", resp); err != nil {
-			return model.GetMillis()
+		var mResp *model.Response
+		if resp != nil {
+			mResp = model.BuildResponse(resp)
 		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "getChannelIDTeam", err, retryCount, 10, mResp)
+
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+
+		if hErr == nil && shouldRetry {
+			retryCount++
+			continue
+		}
+
+		if mResp != nil && mResp.StatusCode == http.StatusNotFound {
+			m.logger.Warnf("getChannelIDTeam failed for %s: %v", name, err)
+		} else {
+			m.logger.Errorf("getChannelIDTeam failed for %s: %v", name, err)
+		}
+
+		return ""
 	}
 }
 
-// GetMoreChannels returns existing channels where we're not a member off.
-func (m *Client) GetMoreChannels() []*model.Channel {
-	m.RLock()
-	defer m.RUnlock()
+func (m *Client) getGroupChannelName(channelID string) string {
+	usersMap, ok := m.Users.channels[channelID]
+	if !ok || len(usersMap) == 0 {
+		return ""
+	}
 
-	var channels []*model.Channel
-	for _, t := range m.OtherTeams {
-		channels = append(channels, t.MoreChannels...)
+	nicks := make([]string, 0, len(usersMap))
+	for userID := range usersMap {
+		if u, exists := m.Users.users[userID]; exists && u.Username != "" {
+			nicks = append(nicks, u.Username)
+		}
+	}
+
+	if len(nicks) == 0 {
+		return ""
+	}
+
+	sort.Strings(nicks)
+
+	return strings.Join(nicks, "-")
+}
+
+func (m *Client) GetChannelName(ctx context.Context, channelID string) string {
+	if ch := m.GetChannel(ctx, channelID); ch != nil {
+		m.Users.mu.RLock()
+		defer m.Users.mu.RUnlock()
+
+		return m.getNormalisedName(ch)
+	}
+	return ""
+}
+
+func (m *Client) GetChannelTeamID(ctx context.Context, id string) string {
+	if ch := m.GetChannel(ctx, id); ch != nil {
+		return ch.TeamId
+	}
+	return ""
+}
+
+func (m *Client) GetDMChannelName(userID1 string, userID2 string) string {
+	return model.GetDMNameFromIds(userID1, userID2)
+}
+
+// GetDMUserIDs extracts the two user IDs from a direct message channel name (userID1__userID2).
+// It returns ok as false if the channel name does not conform to the DM naming format.
+func (m *Client) GetDMUserIDs(channelName string) (string, string, bool) {
+	userID1, userID2, ok := strings.Cut(channelName, "__")
+	if !ok || len(userID1) != mattermostIDLen || len(userID2) != mattermostIDLen {
+		return "", "", false
+	}
+
+	return userID1, userID2, true
+}
+
+// GetDMOtherUserID extracts the opposite participant's user ID from a DM channel name.
+func (m *Client) GetDMOtherUserID(channelName, myUserID string) (string, bool) {
+	userID1, userID2, ok := m.GetDMUserIDs(channelName)
+	if !ok {
+		return "", false
+	}
+
+	if userID1 == myUserID {
+		return userID2, true
+	}
+
+	if userID2 == myUserID {
+		return userID1, true
+	}
+
+	return "", false
+}
+
+//nolint:funlen,gocognit,gocyclo
+func (m *Client) GetChannelUsers(ctx context.Context, channelID string) ([]*model.User, error) {
+	m.Users.mu.RLock()
+	if userIDs, exists := m.Users.channels[channelID]; exists {
+		users := make([]*model.User, 0, len(userIDs))
+		for uid := range userIDs {
+			if user, ok := m.Users.users[uid]; ok {
+				users = append(users, user)
+			}
+		}
+		m.Users.mu.RUnlock()
+		return users, nil
+	}
+	m.Users.mu.RUnlock()
+
+	const batchSize = mattermostPerPageMax
+	fetchedUsers := make([]UserSummary, 0, batchSize)
+
+	channelName := m.GetCachedChannelName(channelID)
+	idx := 0
+	retryCount := 0
+
+	for {
+		if m.IsAborted(ctx) {
+			return nil, errors.New("login aborted")
+		}
+
+		query := "/users?in_channel=" + channelID + "&page=" + strconv.Itoa(idx) + "&per_page=" + strconv.Itoa(batchSize)
+		m.apiLogger.Warnf("GetChannelUsers: DoAPIGet: %s: query %s #%d", channelName, query, retryCount)
+		resp, err := m.Client.DoAPIGet(ctx, query, "")
+		if err != nil {
+			var mResp *model.Response
+			if resp != nil {
+				mResp = model.BuildResponse(resp)
+			}
+			shouldRetry, hErr := m.HandleRetry(ctx, "GetUsersInChannel", err, retryCount, 10, mResp)
+			if hErr == nil && shouldRetry {
+				retryCount++
+				continue
+			}
+			return nil, err
+		}
+		retryCount = 0
+
+		var list []UserSummary
+		if jsonErr := json.NewDecoder(resp.Body).Decode(&list); jsonErr != nil {
+			resp.Body.Close()
+			return nil, jsonErr
+		}
+		resp.Body.Close()
+
+		fetchedUsers = append(fetchedUsers, list...)
+
+		if len(list) < batchSize {
+			break
+		}
+		idx++
+	}
+
+	allUsers := make([]*model.User, 0, len(fetchedUsers))
+
+	m.Users.mu.Lock()
+	if m.Users.channels[channelID] == nil {
+		m.Users.channels[channelID] = make(map[string]struct{}, len(fetchedUsers))
+	}
+
+	for _, u := range fetchedUsers {
+		cachedUser := m.UpdateUserSummary(&u, true)
+
+		allUsers = append(allUsers, cachedUser)
+		m.Users.channels[channelID][cachedUser.Id] = struct{}{}
+	}
+
+	m.Users.lastUpdated.Store(time.Now().Unix())
+	m.Users.mu.Unlock()
+
+	return allUsers, nil
+}
+
+func (m *Client) GetLastViewedAt(ctx context.Context, channelID string) int64 {
+	m.Users.mu.RLock()
+	// Check if the channel is deleted
+	ch, channelExists := m.Users.channelData[channelID]
+	if channelExists && ch.DeleteAt > 0 {
+		m.Users.mu.RUnlock()
+		return 0
+	}
+
+	// Check our view cache
+	if viewedAt, ok := m.Users.channelLastViewedAt[channelID]; ok {
+		m.Users.mu.RUnlock()
+		return viewedAt
+	}
+
+	// Get CreateAt while we still have the read lock, just in case we need it
+	var createAt int64
+	if channelExists {
+		createAt = ch.CreateAt
+	}
+	m.Users.mu.RUnlock()
+
+	m.RLock()
+	userID := m.User.Id
+	m.RUnlock()
+
+	channelName := m.GetCachedChannelName(channelID)
+	userName := m.GetCachedUserName(userID)
+	retryCount := 0
+
+	for {
+		m.apiLogger.Warnf("GetLastViewedAt: Channel %s (%s), User: %s (%s) #%d", channelName, channelID, userName, userID, retryCount)
+		res, resp, err := m.Client.GetChannelMember(ctx, channelID, userID, "")
+		if err == nil {
+			viewedAt := res.LastViewedAt
+			if viewedAt == 0 && createAt > 0 {
+				viewedAt = createAt
+			}
+
+			m.Users.mu.Lock()
+			m.Users.channelLastViewedAt[channelID] = viewedAt
+			m.Users.mu.Unlock()
+
+			return viewedAt
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "GetChannelMember", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+			continue
+		}
+
+		m.logger.Errorf("GetChannelMember failed for %s (%s): %v", channelName, channelID, err)
+
+		// Fallback on error: Return CreateAt if we know it, otherwise current time
+		if createAt > 0 {
+			return createAt
+		}
+		return model.GetMillis()
+	}
+}
+
+// GetMoreChannels returns existing channels where we're not a member of.
+func (m *Client) GetMoreChannels() []*model.Channel {
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
+
+	capSize := max(0, len(m.Users.channelData)-len(m.Users.joinedChannels))
+	channels := make([]*model.Channel, 0, capSize)
+	for id, ch := range m.Users.channelData {
+		if _, joined := m.Users.joinedChannels[id]; !joined {
+			channels = append(channels, ch)
+		}
 	}
 
 	return channels
 }
 
 // GetTeamFromChannel returns teamId belonging to channel (DM channels have no teamId).
-func (m *Client) GetTeamFromChannel(channelID string) string {
-	m.RLock()
-	defer m.RUnlock()
-
-	var channels []*model.Channel
-
-	for _, t := range m.OtherTeams {
-		channels = append(channels, t.Channels...)
-
-		if t.MoreChannels != nil {
-			channels = append(channels, t.MoreChannels...)
+func (m *Client) GetTeamFromChannel(ctx context.Context, channelID string) string {
+	if ch := m.GetChannel(ctx, channelID); ch != nil {
+		if ch.Type == model.ChannelTypeGroup {
+			return "G"
 		}
-
-		for _, c := range channels {
-			if c.Id == channelID {
-				if c.Type == model.ChannelTypeGroup {
-					return "G"
-				}
-
-				return t.ID
-			}
-		}
-
-		channels = nil
+		return ch.TeamId
 	}
-
 	return ""
 }
 
-func (m *Client) JoinChannel(channelID string) error {
-	m.RLock()
-	defer m.RUnlock()
+// IsChannelMember returns true if the user is a member of the given channel ID.
+func (m *Client) IsChannelMember(channelID string) bool {
+	m.Users.mu.RLock()
+	defer m.Users.mu.RUnlock()
 
-	for _, c := range m.Team.Channels {
-		if c.Id == channelID {
-			m.logger.Debug("Not joining ", channelID, " already joined.")
+	if m.Users.joinedChannels == nil {
+		return false
+	}
+
+	_, exists := m.Users.joinedChannels[channelID]
+	return exists
+}
+
+// IsDMChannelName reports whether the given channel name matches the Mattermost
+// direct message naming convention.
+func (m *Client) IsDMChannelName(channelName string) bool {
+	_, _, ok := m.GetDMUserIDs(channelName)
+
+	return ok
+}
+
+func (m *Client) JoinChannel(ctx context.Context, channelID string) error {
+	m.Users.mu.RLock()
+	_, joined := m.Users.joinedChannels[channelID]
+	m.Users.mu.RUnlock()
+
+	channelName := m.GetCachedChannelName(channelID)
+	if joined {
+		m.logger.Debugf("Not joining %s (%s) already joined.", channelName, channelID)
+		return nil
+	}
+
+	m.logger.Debugf("Joining %s (%s)", channelName, channelID)
+
+	_, err := m.AddChannelMember(ctx, channelID, m.User.Id)
+	if err == nil {
+		m.Users.mu.Lock()
+		m.Users.joinedChannels[channelID] = struct{}{}
+		m.Users.mu.Unlock()
+
+		return nil
+	}
+
+	return err
+}
+
+func (m *Client) AddChannelMember(ctx context.Context, channelID, userID string) (*model.ChannelMember, error) {
+	channelName := m.GetCachedChannelName(channelID)
+	userName := m.GetCachedUserName(userID)
+	retryCount := 0
+
+	for {
+		m.apiLogger.Warnf("AddChannelMember: Channel: %s (%s), User: %s (%s) #%d", channelName, channelID, userName, userID, retryCount)
+
+		member, resp, err := m.Client.AddChannelMember(ctx, channelID, userID)
+		if err == nil {
+			return member, nil
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "AddChannelMember", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+
+			continue
+		}
+
+		m.logger.Errorf("AddChannelMember failed for channel %s (%s) (user %s (%s)): %v", channelName, channelID, userName, userID, err)
+
+		return nil, err
+	}
+}
+
+func (m *Client) RemoveUserFromChannel(ctx context.Context, channelID, userID string) error {
+	channelName := m.GetCachedChannelName(channelID)
+	userName := m.GetCachedUserName(userID)
+	retryCount := 0
+
+	for {
+		m.apiLogger.Warnf("RemoveUserFromChannel: Channel: %s (%s), User: %s (%s) #%d", channelName, channelID, userName, userID, retryCount)
+
+		resp, err := m.Client.RemoveUserFromChannel(ctx, channelID, userID)
+		if err == nil {
+			// If we are removing ourselves, clean up our joinedChannels cache
+			m.RLock()
+			isCurrentUser := m.User != nil && userID == m.User.Id
+			m.RUnlock()
+			if isCurrentUser {
+				m.Users.mu.Lock()
+				delete(m.Users.joinedChannels, channelID)
+				m.Users.mu.Unlock()
+			}
 
 			return nil
 		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "RemoveUserFromChannel", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+			continue
+		}
+
+		m.logger.Errorf("RemoveUserFromChannel failed for channel %s (%s) (user %s (%s)): %v", channelName, channelID, userName, userID, err)
+
+		return err
+	}
+}
+
+func (m *Client) PatchChannel(ctx context.Context, channelID string, patch *model.ChannelPatch) (*model.Channel, error) {
+	channelName := m.GetCachedChannelName(channelID)
+	retryCount := 0
+
+	for {
+		m.apiLogger.Warnf("PatchChannel: Channel: %s (%s) #%d", channelName, channelID, retryCount)
+
+		channel, resp, err := m.Client.PatchChannel(ctx, channelID, patch)
+		if err == nil {
+			// Update local cache so GetChannel immediately reflects the updated topic/header
+			m.Users.mu.Lock()
+			m.Users.channelData[channelID] = channel
+			m.Users.mu.Unlock()
+
+			return channel, nil
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "PatchChannel", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+
+			continue
+		}
+
+		m.logger.Errorf("PatchChannel failed for %s (%s): %v", channelName, channelID, err)
+
+		return nil, err
+	}
+}
+
+//nolint:funlen,gocognit,gocyclo
+func (m *Client) UpdateChannelsTeam(ctx context.Context, teamID string) error {
+	const batchSize = mattermostPerPageMax
+
+	var joinedSummaries []ChannelSummary
+
+	retryCount := 0
+	for {
+		if m.IsAborted(ctx) {
+			return errors.New("login aborted")
+		}
+
+		query := "/users/" + m.User.Id + "/teams/" + teamID + "/channels"
+		m.apiLogger.Warnf("UpdateChannelsTeam: DoAPIGet: query %s #%d", query, retryCount)
+		resp, err := m.Client.DoAPIGet(ctx, query, "")
+		if err != nil {
+			var mResp *model.Response
+			if resp != nil {
+				mResp = model.BuildResponse(resp)
+			}
+			shouldRetry, hErr := m.HandleRetry(ctx, "GetChannelsForTeamForUser", err, retryCount, 10, mResp)
+			if hErr == nil && shouldRetry {
+				retryCount++
+				continue
+			}
+			return err
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&joinedSummaries); err != nil {
+			resp.Body.Close()
+			return err
+		}
+		resp.Body.Close()
+		break
 	}
 
-	m.logger.Debug("Joining ", channelID)
+	// Fetch public channels using an inline function to allow for an early return
+	publicSummaries, err := func() ([]ChannelSummary, error) {
+		m.Users.mu.RLock()
+		hasCache := len(m.Users.channelData) > 0
+		m.Users.mu.RUnlock()
 
-	_, _, err := m.Client.AddChannelMember(channelID, m.User.Id)
+		// Skip the heavy public channel crawl if we have a cache and aren't forcing a sync.
+		// We rely on WebSocket events to keep public channels updated organically.
+		if hasCache && !m.ForceSyncOnReconnect {
+			m.logger.Debug("UpdateChannelsTeam: skipping public channel fetch (using cache)")
+			return nil, nil // Early return!
+		}
+
+		m.logger.Trace("UpdateChannelsTeam: fetching public channels (cache empty or ForceSyncOnReconnect enabled)")
+
+		summaries := make([]ChannelSummary, 0, batchSize)
+		var list []ChannelSummary
+
+		idx := 0
+		retryCount := 0
+		for {
+			if m.IsAborted(ctx) {
+				return nil, errors.New("login aborted")
+			}
+			query := "/teams/" + teamID + "/channels?page=" + strconv.Itoa(idx) + "&per_page=" + strconv.Itoa(batchSize)
+			m.apiLogger.Warnf("UpdateChannelsTeam: DoAPIGet: query %s #%d", query, retryCount)
+			resp, err := m.Client.DoAPIGet(ctx, query, "")
+			if err != nil {
+				var mResp *model.Response
+				if resp != nil {
+					mResp = model.BuildResponse(resp)
+				}
+				shouldRetry, hErr := m.HandleRetry(ctx, "GetPublicChannelsForTeam", err, retryCount, 10, mResp)
+				if hErr == nil && shouldRetry {
+					retryCount++
+					continue
+				}
+				return nil, err
+			}
+			retryCount = 0
+
+			list = list[:0]
+			if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+				resp.Body.Close()
+				return nil, err
+			}
+			resp.Body.Close()
+
+			summaries = append(summaries, list...)
+
+			if len(list) < batchSize {
+				break
+			}
+			idx++
+		}
+		return summaries, nil
+	}()
 	if err != nil {
 		return err
 	}
 
-	return nil
-}
-
-func (m *Client) UpdateChannelsTeam(teamID string) error {
-	var (
-		mmchannels []*model.Channel
-		resp       *model.Response
-		err        error
-	)
-
-	for {
-		mmchannels, resp, err = m.Client.GetChannelsForTeamForUser(teamID, m.User.Id, false, "")
-		if err == nil {
-			break
+	// Helper to intern highly repetitive channel types
+	internType := func(t string) model.ChannelType {
+		switch t {
+		case "O":
+			return model.ChannelTypeOpen
+		case "P":
+			return model.ChannelTypePrivate
+		case "D":
+			return model.ChannelTypeDirect
 		}
-
-		if err = m.HandleRatelimit("GetChannelsForTeamForUser", resp); err != nil {
-			return err
-		}
+		return model.ChannelType(t)
 	}
 
-	for idx, t := range m.OtherTeams {
-		if t.ID == teamID {
-			m.Lock()
-			m.OtherTeams[idx].Channels = mmchannels
-			m.Unlock()
-		}
-	}
-
-	idx := 0
-	max := 200
-
-	var moreChannels []*model.Channel
-
-	for {
-		mmchannels, resp, err = m.Client.GetPublicChannelsForTeam(teamID, idx, max, "")
-		if err == nil {
-			break
-		}
-
-		if err := m.HandleRatelimit("GetPublicChannelsForTeam", resp); err != nil {
-			return err
-		}
-	}
-
-	for len(mmchannels) > 0 {
-		moreChannels = append(moreChannels, mmchannels...)
-
-		for {
-			mmchannels, resp, err = m.Client.GetPublicChannelsForTeam(teamID, idx, max, "")
-			if err == nil {
-				idx++
-
-				break
-			}
-
-			if err := m.HandleRatelimit("GetPublicChannelsForTeam", resp); err != nil {
-				return err
+	m.Users.mu.Lock()
+	if m.Users.channelData == nil {
+		totalChannels := len(joinedSummaries) + len(publicSummaries)
+		m.Users.channelData = make(map[string]*model.Channel, totalChannels)
+		m.Users.joinedChannels = make(map[string]struct{}, len(joinedSummaries))
+	} else {
+		for chanID := range m.Users.joinedChannels {
+			if ch, ok := m.Users.channelData[chanID]; ok && ch.TeamId == teamID {
+				delete(m.Users.joinedChannels, chanID)
 			}
 		}
 	}
 
-	for idx, t := range m.OtherTeams {
-		if t.ID == teamID {
-			m.Lock()
-			m.OtherTeams[idx].MoreChannels = moreChannels
-			m.Unlock()
+	for _, ch := range joinedSummaries {
+		cached, exists := m.Users.channelData[ch.Id]
+		if !exists { //nolint:nestif
+			cached = &model.Channel{
+				Id:          ch.Id,
+				UpdateAt:    ch.UpdateAt,
+				DeleteAt:    ch.DeleteAt,
+				TeamId:      teamID,
+				Type:        internType(ch.Type),
+				DisplayName: ch.DisplayName,
+				Name:        ch.Name,
+				Header:      ch.Header,
+				Purpose:     ch.Purpose,
+				LastPostAt:  ch.LastPostAt,
+				CreatorId:   ch.CreatorId,
+			}
+			m.Users.channelData[cached.Id] = cached
+		} else {
+			if cached.DisplayName != ch.DisplayName {
+				cached.DisplayName = ch.DisplayName
+			}
+			if cached.Name != ch.Name {
+				cached.Name = ch.Name
+			}
+			if cached.Header != ch.Header {
+				cached.Header = ch.Header
+			}
+			if cached.Purpose != ch.Purpose {
+				cached.Purpose = ch.Purpose
+			}
+			if cached.UpdateAt < ch.UpdateAt {
+				cached.UpdateAt = ch.UpdateAt
+			}
+			if cached.DeleteAt != ch.DeleteAt {
+				cached.DeleteAt = ch.DeleteAt
+			}
+			if cached.LastPostAt < ch.LastPostAt {
+				cached.LastPostAt = ch.LastPostAt
+			}
+			if newType := internType(ch.Type); cached.Type != newType {
+				cached.Type = newType
+			}
+		}
+		m.Users.joinedChannels[cached.Id] = struct{}{}
+	}
+
+	for _, ch := range publicSummaries {
+		cached, exists := m.Users.channelData[ch.Id]
+		if !exists { //nolint:nestif
+			cached = &model.Channel{
+				Id:          ch.Id,
+				UpdateAt:    ch.UpdateAt,
+				DeleteAt:    ch.DeleteAt,
+				TeamId:      teamID,
+				Type:        internType(ch.Type),
+				DisplayName: ch.DisplayName,
+				Name:        ch.Name,
+				Header:      ch.Header,
+				Purpose:     ch.Purpose,
+				CreatorId:   ch.CreatorId,
+				LastPostAt:  ch.LastPostAt,
+			}
+			m.Users.channelData[cached.Id] = cached
+		} else {
+			if cached.DisplayName != ch.DisplayName {
+				cached.DisplayName = ch.DisplayName
+			}
+			if cached.Name != ch.Name {
+				cached.Name = ch.Name
+			}
+			if cached.Header != ch.Header {
+				cached.Header = ch.Header
+			}
+			if cached.Purpose != ch.Purpose {
+				cached.Purpose = ch.Purpose
+			}
+			if cached.UpdateAt < ch.UpdateAt {
+				cached.UpdateAt = ch.UpdateAt
+			}
+			if cached.DeleteAt != ch.DeleteAt {
+				cached.DeleteAt = ch.DeleteAt
+			}
+			if cached.LastPostAt < ch.LastPostAt {
+				cached.LastPostAt = ch.LastPostAt
+			}
+			if newType := internType(ch.Type); cached.Type != newType {
+				cached.Type = newType
+			}
 		}
 	}
+	m.Users.mu.Unlock()
+
+	m.Users.lastUpdated.Store(time.Now().Unix())
+
+	m.Lock()
+	if team, exists := m.OtherTeams[teamID]; exists {
+		team.LastChannelSync = time.Now()
+	}
+	m.Unlock()
 
 	return nil
 }
 
-func (m *Client) UpdateChannels() error {
-	if err := m.UpdateChannelsTeam(m.Team.ID); err != nil {
+func (m *Client) UpdateChannels(ctx context.Context) error {
+	if m.Team == nil {
+		m.logger.Errorf("cannot update channels: primary team is nil")
+		return errors.New("cannot update channels: primary team is nil")
+	}
+
+	if err := m.UpdateChannelsTeam(ctx, m.Team.ID); err != nil {
 		return err
 	}
 
@@ -285,7 +1038,7 @@ func (m *Client) UpdateChannels() error {
 		if t.ID == m.Team.ID {
 			continue
 		}
-		if err := m.UpdateChannelsTeam(t.ID); err != nil {
+		if err := m.UpdateChannelsTeam(ctx, t.ID); err != nil {
 			return err
 		}
 	}
@@ -293,32 +1046,94 @@ func (m *Client) UpdateChannels() error {
 	return nil
 }
 
-func (m *Client) UpdateChannelHeader(channelID string, header string) {
+func (m *Client) UpdateChannelHeader(ctx context.Context, channelID string, header string) {
 	channel := &model.Channel{Id: channelID, Header: header}
-
 	m.logger.Debugf("updating channelheader %#v, %#v", channelID, header)
 
-	_, _, err := m.Client.UpdateChannel(channel)
-	if err != nil {
-		m.logger.Error(err)
+	channelName := m.GetCachedChannelName(channelID)
+	retryCount := 0
+
+	for {
+		m.apiLogger.Warnf("UpdateChannelHeader: Channel: %s (%s) #%d", channelName, channelID, retryCount)
+
+		_, resp, err := m.Client.UpdateChannel(ctx, channel)
+		if err == nil {
+			return
+		}
+
+		shouldRetry, hErr := m.HandleRetry(ctx, "UpdateChannel", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+
+			continue
+		}
+
+		m.logger.Errorf("UpdateChannelHeader failed for %s (%s): %v", channelName, channelID, err)
+
+		return
 	}
 }
 
-func (m *Client) UpdateLastViewed(channelID string) error {
-	m.logger.Debugf("posting lastview %#v", channelID)
+func (m *Client) UpdateChannelUsersCache(channelID string, user *model.User) {
+	m.Users.mu.Lock()
+	defer m.Users.mu.Unlock()
+
+	m.UpdateUser(user, true)
+
+	if channelID != "" {
+		if m.Users.channels[channelID] != nil {
+			m.Users.channels[channelID][user.Id] = struct{}{}
+		}
+	}
+
+	m.Users.lastUpdated.Store(time.Now().Unix())
+}
+
+func (m *Client) UpdateChannelUsersCacheRemove(channelID string, userID string) {
+	m.Users.mu.Lock()
+	defer m.Users.mu.Unlock()
+
+	if m.Users.channels != nil && m.Users.channels[channelID] != nil {
+		delete(m.Users.channels[channelID], userID)
+	}
+}
+
+func (m *Client) UpdateLastViewed(ctx context.Context, channelID string) error {
+	m.Users.mu.RLock()
+	lastViewed := m.Users.channelLastViewedAt[channelID]
+	m.Users.mu.RUnlock()
+
+	// Skip API call if this specific channel was marked viewed within the last 3 seconds
+	if lastViewed > 0 && time.Since(time.UnixMilli(lastViewed)) < 3*time.Second {
+		return nil
+	}
+
+	channelName := m.GetCachedChannelName(channelID)
+	userName := m.GetCachedUserName(m.User.Id)
+
+	m.logger.Debugf("posting lastview %s %#v", channelName, channelID)
 
 	view := &model.ChannelView{ChannelId: channelID}
 
+	retryCount := 0
 	for {
-		_, resp, err := m.Client.ViewChannel(m.User.Id, view)
+		m.apiLogger.Infof("UpdateLastViewed: Channel: %s (%s), User: %s (%s) #%d", channelName, channelID, userName, m.User.Id, retryCount)
+		_, resp, err := m.Client.ViewChannel(ctx, m.User.Id, view)
 		if err == nil {
+			m.Users.mu.Lock()
+			m.Users.channelLastViewedAt[channelID] = time.Now().UnixMilli()
+			m.Users.mu.Unlock()
+
 			return nil
 		}
 
-		if err := m.HandleRatelimit("ViewChannel", resp); err != nil {
-			m.logger.Errorf("ChannelView update for %s failed: %s", channelID, err)
-
-			return err
+		shouldRetry, hErr := m.HandleRetry(ctx, "ViewChannel", err, retryCount, 10, resp)
+		if hErr == nil && shouldRetry {
+			retryCount++
+			continue
 		}
+
+		m.logger.Errorf("ChannelView update for %s (%s) failed: %v", channelName, channelID, err)
+		return err
 	}
 }

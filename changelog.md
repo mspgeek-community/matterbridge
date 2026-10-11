@@ -1,3 +1,39 @@
+# v1.27.0-mspgeek
+
+First release of the MSPGeek fork (mspgeek/matterbridge PRs #1-#4).
+
+## Breaking changes / config
+
+- general: Persistent message store `MessageStore` (default `/etc/matterbridge/msgstore.db`, `-` disables) and `MessageStoreRetentionDays` (default 180). Mount `/etc/matterbridge` as a persistent volume. An existing `cache.json` is imported once.
+- general: `StartupFailureDelay` (default 300 seconds, `-1` exits immediately) delays exiting after a failed start so container restarts cannot loop.
+- slack: `DiscordToken` and `DiscordServer` are no longer used; Slack channel links are resolved through the Discord bridge.
+- docker: The image is built with `-tags nomattermost` (the Mattermost bridge is not included).
+- build: Go 1.27; all compiled-in dependencies updated.
+
+## New features
+
+- general: Message mappings (threads, edits, deletes) survive restarts.
+- general: @mentions carry the user's names from the source, so the right user is linked on the other side; names are matched ignoring case, spaces and punctuation.
+- general: Slack channel links become Discord channel links when a channel with exactly that name exists.
+
+## Enhancements
+
+- discord: Load all server members (was the first 1000), in the background after the first page.
+- slack: Load all workspace users (was about 2200), in the background.
+- slack: File uploads use the files.getUploadURLExternal flow (files.upload was retired by Slack).
+- general: Removed debug output from the message path (full message JSON incl. file data at info level, Discord channel pointer dump).
+- discord, general: Two upstream fixes cherry-picked (nick whitespace, UTF-8 splitting).
+
+## Bugfixes
+
+- discord: Stop reconnect storms that got the bot token reset (a new Discord login per Slack message with an attachment, discordgo's own reconnect loop); reconnects back off and are capped at 100 per 24 hours.
+- general: Old messages were replayed when platforms sent update events that were not edits (threads, pins, link previews, reply counts); only fresh edits are relayed and an edit is never posted as a new message.
+- general: Thread mappings were lost on restart and evicted within days (shared cache.json, every message cached in every gateway).
+- discord, slack: Crashes from nil dereferences and concurrent map writes; a disabled bridge no longer crashes the process.
+- slack: A failed user or channel refresh no longer blocks the Slack event loop forever.
+- slack: Links whose label repeats the URL are relayed as plain URLs; the broken "In reply to" link is no longer appended.
+- general: "@" inside URLs is never treated as a mention.
+
 # v1.26.0
 
 ## New features

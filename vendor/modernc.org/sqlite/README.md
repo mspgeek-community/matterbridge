@@ -1,76 +1,135 @@
-# sqlite
+### Pure-Go SQLite, no cgo
 
-Package sqlite is a cgo-free port of SQLite. Although you could see mattn's driver (`github.com/mattn/go-sqlite3`) in go.mod file, we import it for tests only.
+The repository you are currently viewing might be a mirror. Please review the guidelines below based on where you are viewing this:
 
-SQLite is an in-process implementation of a self-contained, serverless,
-zero-configuration, transactional SQL database engine.
+| Platform | Role | Contributing Guidelines |
+| :--- | :--- | :--- |
+| **GitLab** | **Primary Source** | This is the canonical repository (`cznic/sqlite`). CI pipelines and main development happen here. |
+| **GitHub** | **Mirror** | This is a mirror (`modernc-org/sqlite`). We **do accept** Issues and Pull Requests here for your convenience! <br> *Note: PRs submitted here will be manually merged into the GitLab source, so please allow extra time for processing.* |
 
-## Thanks
+[![Go Reference](https://pkg.go.dev/badge/modernc.org/sqlite.svg)](https://pkg.go.dev/modernc.org/sqlite)
+[![LiberaPay](https://liberapay.com/assets/widgets/donate.svg)](https://liberapay.com/jnml/donate)
+[![receives](https://img.shields.io/liberapay/receives/jnml.svg?logo=liberapay)](https://liberapay.com/jnml/donate)
+[![patrons](https://img.shields.io/liberapay/patrons/jnml.svg?logo=liberapay)](https://liberapay.com/jnml/donate)
 
-This project is sponsored by Schleibinger Geräte Teubert u. Greim GmbH by
-allowing one of the maintainers to work on it also in office hours.
+---
 
-## Installation
+![heart](sponsors/heart.png "heart")
+[Github Sponsors Account](https://github.com/sponsors/j-modernc-org) /  j-modernc-org
 
-    $ go get modernc.org/sqlite
+### Enterprise Infrastructure Tier Sponsor
 
-## Documentation
+![tailscale](sponsors/tailscale.png "tailscale") [Tailscale](https://tailscale.com/)
 
-[godoc.org/modernc.org/sqlite](http://godoc.org/modernc.org/sqlite)
+### Startup / Small Business Tier Sponsor
 
-## Builders
+![exe.dev](sponsors/boldsoftware.png "boldsoftware") [exe.dev](https://exe.dev)
 
-[modern-c.appspot.com/-/builder/?importpath=modernc.org%2fsqlite](https://modern-c.appspot.com/-/builder/?importpath=modernc.org%2fsqlite)
+![octoberswimmer](sponsors/octoberswimmer.png "osctoberswimmer") [October Swimmer](https://www.octoberswimmer.com/)
 
-## Speedtest1
+---
 
-Numbers for the pure Go version were produced by
+![benchmarks](bench.png "benchmarks") [The SQLite Drivers Benchmarks Game]
 
-     ~/src/modernc.org/sqlite/speedtest1$ go build && ./speedtest1
+[The SQLite Drivers Benchmarks Game]: https://pkg.go.dev/modernc.org/sqlite-bench#readme-tl-dr-scorecard
 
-Numbers for the pure C version were produced by
+---
 
-     ~/src/modernc.org/sqlite/testdata/sqlite-src-3410200/test$ gcc speedtest1.c ../../sqlite-amalgamation-3410200/sqlite3.c -lpthread -ldl && ./a.out
+Changelog
+---------
 
-The results are from Go version 1.20.4 and GCC version 10.2.1 on a
-Linux/amd64 machine, CPU: AMD Ryzen 9 3900X 12-Core Processor × 24, 128GB
-RAM. Shown are the best of 3 runs.
+Release notes are kept in [CHANGELOG.md](CHANGELOG.md).
 
-     Go											C
+Contributing
+------------
 
-     -- Speedtest1 for SQLite 3.41.2 2023-03-22 11:56:21 0d1fc92f94cb6b76bffe3ec34d69	-- Speedtest1 for SQLite 3.41.2 2023-03-22 11:56:21 0d1fc92f94cb6b76bffe3ec34d69
-      100 - 50000 INSERTs into table with no index......................    0.071s            100 - 50000 INSERTs into table with no index......................    0.077s
-      110 - 50000 ordered INSERTS with one index/PK.....................    0.114s            110 - 50000 ordered INSERTS with one index/PK.....................    0.082s
-      120 - 50000 unordered INSERTS with one index/PK...................    0.137s            120 - 50000 unordered INSERTS with one index/PK...................    0.099s
-      130 - 25 SELECTS, numeric BETWEEN, unindexed......................    0.083s            130 - 25 SELECTS, numeric BETWEEN, unindexed......................    0.091s
-      140 - 10 SELECTS, LIKE, unindexed.................................    0.210s            140 - 10 SELECTS, LIKE, unindexed.................................    0.120s
-      142 - 10 SELECTS w/ORDER BY, unindexed............................    0.276s            142 - 10 SELECTS w/ORDER BY, unindexed............................    0.182s
-      145 - 10 SELECTS w/ORDER BY and LIMIT, unindexed..................    0.183s            145 - 10 SELECTS w/ORDER BY and LIMIT, unindexed..................    0.099s
-      150 - CREATE INDEX five times.....................................    0.172s            150 - CREATE INDEX five times.....................................    0.127s
-      160 - 10000 SELECTS, numeric BETWEEN, indexed.....................    0.080s            160 - 10000 SELECTS, numeric BETWEEN, indexed.....................    0.078s
-      161 - 10000 SELECTS, numeric BETWEEN, PK..........................    0.080s            161 - 10000 SELECTS, numeric BETWEEN, PK..........................    0.078s
-      170 - 10000 SELECTS, text BETWEEN, indexed........................    0.187s            170 - 10000 SELECTS, text BETWEEN, indexed........................    0.169s
-      180 - 50000 INSERTS with three indexes............................    0.196s            180 - 50000 INSERTS with three indexes............................    0.154s
-      190 - DELETE and REFILL one table.................................    0.200s            190 - DELETE and REFILL one table.................................    0.155s
-      200 - VACUUM......................................................    0.180s            200 - VACUUM......................................................    0.142s
-      210 - ALTER TABLE ADD COLUMN, and query...........................    0.004s            210 - ALTER TABLE ADD COLUMN, and query...........................    0.005s
-      230 - 10000 UPDATES, numeric BETWEEN, indexed.....................    0.093s            230 - 10000 UPDATES, numeric BETWEEN, indexed.....................    0.080s
-      240 - 50000 UPDATES of individual rows............................    0.153s            240 - 50000 UPDATES of individual rows............................    0.137s
-      250 - One big UPDATE of the whole 50000-row table.................    0.024s            250 - One big UPDATE of the whole 50000-row table.................    0.019s
-      260 - Query added column after filling............................    0.004s            260 - Query added column after filling............................    0.005s
-      270 - 10000 DELETEs, numeric BETWEEN, indexed.....................    0.278s            270 - 10000 DELETEs, numeric BETWEEN, indexed.....................    0.263s
-      280 - 50000 DELETEs of individual rows............................    0.188s            280 - 50000 DELETEs of individual rows............................    0.180s
-      290 - Refill two 50000-row tables using REPLACE...................    0.411s            290 - Refill two 50000-row tables using REPLACE...................    0.359s
-      300 - Refill a 50000-row table using (b&1)==(a&1).................    0.175s            300 - Refill a 50000-row table using (b&1)==(a&1).................    0.151s
-      310 - 10000 four-ways joins.......................................    0.427s            310 - 10000 four-ways joins.......................................    0.365s
-      320 - subquery in result set......................................    0.440s            320 - subquery in result set......................................    0.521s
-      400 - 70000 REPLACE ops on an IPK.................................    0.125s            400 - 70000 REPLACE ops on an IPK.................................    0.106s
-      410 - 70000 SELECTS on an IPK.....................................    0.081s            410 - 70000 SELECTS on an IPK.....................................    0.078s
-      500 - 70000 REPLACE on TEXT PK....................................    0.174s            500 - 70000 REPLACE on TEXT PK....................................    0.116s
-      510 - 70000 SELECTS on a TEXT PK..................................    0.153s            510 - 70000 SELECTS on a TEXT PK..................................    0.117s
-      520 - 70000 SELECT DISTINCT.......................................    0.083s            520 - 70000 SELECT DISTINCT.......................................    0.067s
-      980 - PRAGMA integrity_check......................................    0.436s            980 - PRAGMA integrity_check......................................    0.377s
-      990 - ANALYZE.....................................................    0.107s            990 - ANALYZE.....................................................    0.038s
-            TOTAL.......................................................    5.525s                  TOTAL.......................................................    4.637s
+[CONTRIBUTING.md](CONTRIBUTING.md) covers where to send a merge request or pull
+request, how to build and test, and the one thing that is not obvious from the
+tree: most of the Go here is generated from C and edits to it are lost at the
+next re-vendoring.
 
-This particular test executes 16.1% faster in the C version.
+Security
+--------
+
+Please report a vulnerability privately rather than in a public issue.
+[SECURITY.md](SECURITY.md) names three private channels, says what is in scope
+-- including transpilation faults, the bug class unique to a project that ships
+SQLite's C as generated Go -- and describes the disclosure path, which includes
+filing the advisory with the Go vulnerability database so that `govulncheck`
+reports it.
+
+Licensing
+---------
+
+This package is BSD-3-Clause ([LICENSE](LICENSE)). It also carries a large body of
+third-party code: SQLite itself, which is public domain ([LICENSE-SQLITE](LICENSE-SQLITE)),
+the `sqlite-vec` extension, MIT ([LICENSE-SQLITE_VEC](LICENSE-SQLITE_VEC)), and the Go
+module dependency graph.
+
+[LICENSE-3RD-PARTY.md](LICENSE-3RD-PARTY.md) accounts for all of it, transitively and
+in full text, and separates what is linked into your binary from what merely appears in
+the module graph.
+
+A machine-readable SBOM ships beside it: [`sbom.cdx.json`](sbom.cdx.json) (CycloneDX 1.6)
+and [`sbom.spdx.json`](sbom.spdx.json) (SPDX 2.3), with [SBOM.md](SBOM.md) explaining
+what they cover. They name the transpiled SQLite and `sqlite-vec` C that no Go module
+graph reports, which is the part a stock SBOM tool gets wrong about this project.
+
+All four are generated from the tree by `make sbom`; do not edit them by hand.
+
+Virtual Tables (vtab)
+---------------------
+
+The driver exposes a Go API to implement SQLite virtual table modules in pure Go via the `modernc.org/sqlite/vtab` package. This lets you back SQL tables with arbitrary data sources (e.g., vector indexes, CSV files, remote APIs) and integrate with SQLite’s planner.
+
+- Register: `vtab.RegisterModule(db, name, module)`. A nil `db` registers on the driver this package registers as `sqlite`, whose modules reach every connection in the process; a non-nil `db` registers on the driver backing it, so a `db` opened on a caller-constructed `sqlite.Driver` keeps its modules to that driver's connections. Registration applies to new connections only.
+- Schema declaration: Call `ctx.Declare("CREATE TABLE <name>(<cols...>)")` within `Create` or `Connect`. The driver does not auto-declare schemas, enabling dynamic schemas.
+- Module arguments: `args []string` passed to `Create/Connect` are configuration parsed from `USING module(...)`. They are not treated as columns unless your module chooses to.
+- Planning (BestIndex):
+  - Inspect `info.Constraints` (with `Column`, `Op`, `Usable`, 0-based `ArgIndex`, and `Omit`), `info.OrderBy`, and `info.ColUsed` (bitmask of referenced columns).
+  - Set `ArgIndex` (0-based) to populate `Filter`’s `vals` in the chosen order; set `Omit` to ask SQLite not to re-check a constraint you fully handle.
+- Execution: `Cursor.Filter(idxNum, idxStr, vals)` receives arguments in the order implied by `ArgIndex`.
+- Operators: Common SQLite operators map to `ConstraintOp` (EQ/NE/GT/GE/LT/LE/MATCH/IS/ISNOT/ISNULL/ISNOTNULL/LIKE/GLOB/REGEXP/FUNCTION/LIMIT/OFFSET). Unknown operators map to `OpUnknown`.
+- Errors: Returning an error from vtab methods surfaces a descriptive message to SQLite (e.g., `zErrMsg` for xCreate/xConnect/xBestIndex/xFilter; `sqlite3_result_error` for xColumn).
+
+Examples
+--------
+
+- Vector search (sqlite-vec style):
+  - `CREATE VIRTUAL TABLE vec_docs USING vec(dim=128, metric="cosine")`
+  - Module reads args (e.g., `dim`, `metric`), calls `ctx.Declare("CREATE TABLE vec_docs(id, embedding, content HIDDEN)")`, and implements search via `BestIndex`/`Filter`.
+
+- CSV loader:
+  - `CREATE VIRTUAL TABLE csv_users USING csv(filename="/tmp/users.csv", delimiter=",", header=true)`
+  - Module reads the file header to compute columns, declares them via `ctx.Declare("CREATE TABLE csv_users(name, email, ...)")`, and streams rows via a cursor.
+
+See `vtab` package docs for full API details.
+
+Generated sources (deduplication)
+---------------------------------
+
+The transpiled SQLite C amalgamation in `lib/` and the `sqlite-vec` extension in
+`vec/` ship one generated Go file per `GOOS`/`GOARCH`. Declarations that are
+byte-identical across targets are folded into build-tagged shared files —
+`lib/sqlite.go` plus `lib/sqlite_g_<hex>.go` (and `vec/vec.go` plus
+`vec/vec_g_<hex>.go`) — by [`modernc.org/undup`](https://gitlab.com/cznic/undup),
+wired into `make vendor`. Go's build constraints make every target compile exactly
+the same set of declarations as before, so this is purely a packaging change: it
+keeps each tag's module download well under Go's 500&nbsp;MB cap and does not
+affect the public API or behavior.
+
+To read or debug a single target's full, self-contained generated source, expand
+the tree back to one complete file per target:
+
+```sh
+go run modernc.org/undup@v0.0.5 -expand -dir lib   # writes full lib/sqlite_<goos>_<goarch>.go
+go run modernc.org/undup@v0.0.5 -expand -dir vec   # writes full vec/vec_<goos>_<goarch>.go
+```
+
+This removes the shared `*_g_*.go` files and rewrites each
+`*_<goos>_<goarch>.go` as a standalone file — convenient for grepping, reading, or
+stepping through one platform's code. Restore the committed, deduplicated form
+with `git checkout -- lib vec`, or re-fold in place with
+`go run modernc.org/undup@v0.0.5 -dir lib` (and `-dir vec`). Hand-written platform
+files (`libsqlite3_*.go`, `hooks_*.go`, …) carry no generated-code marker and are
+never touched by either step.

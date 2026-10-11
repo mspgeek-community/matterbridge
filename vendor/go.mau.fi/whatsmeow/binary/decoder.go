@@ -165,7 +165,7 @@ func (r *binaryDecoder) readListSize(tag int) (int, error) {
 	}
 }
 
-func (r *binaryDecoder) read(string bool) (interface{}, error) {
+func (r *binaryDecoder) read(string bool) (any, error) {
 	tagByte, err := r.readByte()
 	if err != nil {
 		return nil, err
@@ -204,6 +204,10 @@ func (r *binaryDecoder) read(string bool) (interface{}, error) {
 		}
 
 		return token.GetDoubleToken(tag-token.Dictionary0, i)
+	case token.FBJID:
+		return r.readFBJID()
+	case token.InteropJID:
+		return r.readInteropJID()
 	case token.JIDPair:
 		return r.readJIDPair()
 	case token.ADJID:
@@ -218,7 +222,7 @@ func (r *binaryDecoder) read(string bool) (interface{}, error) {
 	}
 }
 
-func (r *binaryDecoder) readJIDPair() (interface{}, error) {
+func (r *binaryDecoder) readJIDPair() (any, error) {
 	user, err := r.read(true)
 	if err != nil {
 		return nil, err
@@ -234,7 +238,56 @@ func (r *binaryDecoder) readJIDPair() (interface{}, error) {
 	return types.NewJID(user.(string), server.(string)), nil
 }
 
-func (r *binaryDecoder) readADJID() (interface{}, error) {
+func (r *binaryDecoder) readInteropJID() (any, error) {
+	user, err := r.read(true)
+	if err != nil {
+		return nil, err
+	}
+	device, err := r.readInt16(false)
+	if err != nil {
+		return nil, err
+	}
+	integrator, err := r.readInt16(false)
+	if err != nil {
+		return nil, err
+	}
+	server, err := r.read(true)
+	if err != nil {
+		return nil, err
+	} else if server != types.InteropServer {
+		return nil, fmt.Errorf("%w: expected %q, got %q", ErrInvalidJIDType, types.InteropServer, server)
+	}
+	return types.JID{
+		User:       user.(string),
+		Device:     uint16(device),
+		Integrator: uint16(integrator),
+		Server:     types.InteropServer,
+	}, nil
+}
+
+func (r *binaryDecoder) readFBJID() (any, error) {
+	user, err := r.read(true)
+	if err != nil {
+		return nil, err
+	}
+	device, err := r.readInt16(false)
+	if err != nil {
+		return nil, err
+	}
+	server, err := r.read(true)
+	if err != nil {
+		return nil, err
+	} else if server != types.MessengerServer {
+		return nil, fmt.Errorf("%w: expected %q, got %q", ErrInvalidJIDType, types.MessengerServer, server)
+	}
+	return types.JID{
+		User:   user.(string),
+		Device: uint16(device),
+		Server: server.(string),
+	}, nil
+}
+
+func (r *binaryDecoder) readADJID() (any, error) {
 	agent, err := r.readByte()
 	if err != nil {
 		return nil, err
@@ -330,7 +383,7 @@ func (r *binaryDecoder) readNode() (*Node, error) {
 	return ret, err
 }
 
-func (r *binaryDecoder) readBytesOrString(length int, asString bool) (interface{}, error) {
+func (r *binaryDecoder) readBytesOrString(length int, asString bool) (any, error) {
 	data, err := r.readRaw(length)
 	if err != nil {
 		return nil, err

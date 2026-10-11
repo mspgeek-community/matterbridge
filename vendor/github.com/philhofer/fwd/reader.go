@@ -1,10 +1,10 @@
-// The `fwd` package provides a buffered reader
+// Package fwd provides a buffered reader
 // and writer. Each has methods that help improve
 // the encoding/decoding performance of some binary
 // protocols.
 //
-// The `fwd.Writer` and `fwd.Reader` type provide similar
-// functionality to their counterparts in `bufio`, plus
+// The [Writer] and [Reader] type provide similar
+// functionality to their counterparts in [bufio], plus
 // a few extra utility methods that simplify read-ahead
 // and write-ahead. I wrote this package to improve serialization
 // performance for http://github.com/tinylib/msgp,
@@ -14,24 +14,23 @@
 // the user to access and manipulate the buffer memory
 // directly.
 //
-// The extra methods for `fwd.Reader` are `Peek`, `Skip`
-// and `Next`. `(*fwd.Reader).Peek`, unlike `(*bufio.Reader).Peek`,
+// The extra methods for [Reader] are [Reader.Peek], [Reader.Skip]
+// and [Reader.Next]. (*fwd.Reader).Peek, unlike (*bufio.Reader).Peek,
 // will re-allocate the read buffer in order to accommodate arbitrarily
-// large read-ahead. `(*fwd.Reader).Skip` skips the next `n` bytes
-// in the stream, and uses the `io.Seeker` interface if the underlying
-// stream implements it. `(*fwd.Reader).Next` returns a slice pointing
-// to the next `n` bytes in the read buffer (like `Peek`), but also
+// large read-ahead. (*fwd.Reader).Skip skips the next 'n' bytes
+// in the stream, and uses the [io.Seeker] interface if the underlying
+// stream implements it. (*fwd.Reader).Next returns a slice pointing
+// to the next 'n' bytes in the read buffer (like Reader.Peek), but also
 // increments the read position. This allows users to process streams
 // in arbitrary block sizes without having to manage appropriately-sized
 // slices. Additionally, obviating the need to copy the data from the
 // buffer to another location in memory can improve performance dramatically
 // in CPU-bound applications.
 //
-// `fwd.Writer` only has one extra method, which is `(*fwd.Writer).Next`, which
-// returns a slice pointing to the next `n` bytes of the writer, and increments
+// [Writer] only has one extra method, which is (*fwd.Writer).Next, which
+// returns a slice pointing to the next 'n' bytes of the writer, and increments
 // the write position by the length of the returned slice. This allows users
 // to write directly to the end of the buffer.
-//
 package fwd
 
 import (
@@ -83,9 +82,10 @@ type Reader struct {
 	r io.Reader // underlying reader
 
 	// data[n:len(data)] is buffered data; data[len(data):cap(data)] is free buffer space
-	data  []byte // data
-	n     int    // read offset
-	state error  // last read error
+	data        []byte // data
+	n           int    // read offset
+	inputOffset int64  // offset in the input stream
+	state       error  // last read error
 
 	// if the reader past to NewReader was
 	// also an io.Seeker, this is non-nil
@@ -98,6 +98,7 @@ func (r *Reader) Reset(rd io.Reader) {
 	r.r = rd
 	r.data = r.data[0:0]
 	r.n = 0
+	r.inputOffset = 0
 	r.state = nil
 	if s, ok := rd.(io.Seeker); ok {
 		r.rs = s
@@ -129,6 +130,8 @@ func (r *Reader) more() {
 		// discard the io.EOF if we read more than 0 bytes.
 		// the next call to Read should return io.EOF again.
 		r.state = nil
+	} else if r.state != nil {
+		return
 	}
 	r.data = r.data[:len(r.data)+a]
 }
@@ -156,6 +159,9 @@ func (r *Reader) Buffered() int { return len(r.data) - r.n }
 
 // BufferSize returns the total size of the buffer
 func (r *Reader) BufferSize() int { return cap(r.data) }
+
+// InputOffset returns the input stream byte offset of the current reader position
+func (r *Reader) InputOffset() int64 { return r.inputOffset }
 
 // Peek returns the next 'n' buffered bytes,
 // reading from the underlying reader if necessary.
@@ -190,16 +196,50 @@ func (r *Reader) Peek(n int) ([]byte, error) {
 	return r.data[r.n : r.n+n], nil
 }
 
+func (r *Reader) PeekByte() (b byte, err error) {
+	if len(r.data)-r.n >= 1 {
+		b = r.data[r.n]
+	} else {
+		b, err = r.peekByte()
+	}
+	return
+}
+
+func (r *Reader) peekByte() (byte, error) {
+	const n = 1
+	if cap(r.data) < n {
+		old := r.data[r.n:]
+		r.data = make([]byte, n+r.buffered())
+		r.data = r.data[:copy(r.data, old)]
+		r.n = 0
+	}
+
+	// keep filling until
+	// we hit an error or
+	// read enough bytes
+	for r.buffered() < n && r.state == nil {
+		r.more()
+	}
+
+	// we must have hit an error
+	if r.buffered() < n {
+		return 0, r.err()
+	}
+	return r.data[r.n], nil
+}
+
 // discard(n) discards up to 'n' buffered bytes, and
 // and returns the number of bytes discarded
 func (r *Reader) discard(n int) int {
 	inbuf := r.buffered()
 	if inbuf <= n {
 		r.n = 0
+		r.inputOffset += int64(inbuf)
 		r.data = r.data[:0]
 		return inbuf
 	}
 	r.n += n
+	r.inputOffset += int64(n)
 	return n
 }
 
@@ -211,11 +251,11 @@ func (r *Reader) discard(n int) int {
 //
 // If the reader encounters
 // an EOF before skipping 'n' bytes, it
-// returns io.ErrUnexpectedEOF. If the
-// underlying reader implements io.Seeker, then
+// returns [io.ErrUnexpectedEOF]. If the
+// underlying reader implements [io.Seeker], then
 // those rules apply instead. (Many implementations
-// will not return `io.EOF` until the next call
-// to Read.)
+// will not return [io.EOF] until the next call
+// to Read).
 func (r *Reader) Skip(n int) (int, error) {
 	if n < 0 {
 		return 0, os.ErrInvalid
@@ -227,6 +267,7 @@ func (r *Reader) Skip(n int) (int, error) {
 	// if we can Seek() through the remaining bytes, do that
 	if n > skipped && r.rs != nil {
 		nn, err := r.rs.Seek(int64(n-skipped), 1)
+		r.inputOffset += nn
 		return int(nn) + skipped, err
 	}
 	// otherwise, keep filling the buffer
@@ -247,8 +288,18 @@ func (r *Reader) Skip(n int) (int, error) {
 // If an the returned slice is less than the
 // length asked for, an error will be returned,
 // and the reader position will not be incremented.
-func (r *Reader) Next(n int) ([]byte, error) {
+func (r *Reader) Next(n int) (b []byte, err error) {
+	if r.state == nil && len(r.data)-r.n >= n {
+		b = r.data[r.n : r.n+n]
+		r.n += n
+		r.inputOffset += int64(n)
+	} else {
+		b, err = r.next(n)
+	}
+	return
+}
 
+func (r *Reader) next(n int) ([]byte, error) {
 	// in case the buffer is too small
 	if cap(r.data) < n {
 		old := r.data[r.n:]
@@ -267,16 +318,18 @@ func (r *Reader) Next(n int) ([]byte, error) {
 	}
 	out := r.data[r.n : r.n+n]
 	r.n += n
+	r.inputOffset += int64(n)
 	return out, nil
 }
 
-// Read implements `io.Reader`
+// Read implements [io.Reader].
 func (r *Reader) Read(b []byte) (int, error) {
 	// if we have data in the buffer, just
 	// return that.
 	if r.buffered() != 0 {
 		x := copy(b, r.data[r.n:])
 		r.n += x
+		r.inputOffset += int64(x)
 		return x, nil
 	}
 	var n int
@@ -293,6 +346,9 @@ func (r *Reader) Read(b []byte) (int, error) {
 	if n == 0 {
 		return 0, r.err()
 	}
+
+	r.inputOffset += int64(n)
+
 	return n, nil
 }
 
@@ -312,9 +368,11 @@ func (r *Reader) ReadFull(b []byte) (int, error) {
 			nn = copy(b[n:], r.data[r.n:])
 			n += nn
 			r.n += nn
+			r.inputOffset += int64(nn)
 		} else if l-n > cap(r.data) {
 			nn, r.state = r.r.Read(b[n:])
 			n += nn
+			r.inputOffset += int64(nn)
 		} else {
 			r.more()
 		}
@@ -325,7 +383,7 @@ func (r *Reader) ReadFull(b []byte) (int, error) {
 	return n, nil
 }
 
-// ReadByte implements `io.ByteReader`
+// ReadByte implements [io.ByteReader].
 func (r *Reader) ReadByte() (byte, error) {
 	for r.buffered() < 1 && r.state == nil {
 		r.more()
@@ -335,10 +393,12 @@ func (r *Reader) ReadByte() (byte, error) {
 	}
 	b := r.data[r.n]
 	r.n++
+	r.inputOffset++
+
 	return b, nil
 }
 
-// WriteTo implements `io.WriterTo`
+// WriteTo implements [io.WriterTo].
 func (r *Reader) WriteTo(w io.Writer) (int64, error) {
 	var (
 		i   int64
@@ -354,6 +414,7 @@ func (r *Reader) WriteTo(w io.Writer) (int64, error) {
 		}
 		r.data = r.data[0:0]
 		r.n = 0
+		r.inputOffset += int64(ii)
 	}
 	for r.state == nil {
 		// here we just do
@@ -367,6 +428,7 @@ func (r *Reader) WriteTo(w io.Writer) (int64, error) {
 			}
 			r.data = r.data[0:0]
 			r.n = 0
+			r.inputOffset += int64(ii)
 		}
 	}
 	if r.state != io.EOF {

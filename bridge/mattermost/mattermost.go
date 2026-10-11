@@ -1,16 +1,17 @@
 package bmattermost
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
+	"github.com/matterbridge/matterclient"
 	"github.com/mspgeek-community/matterbridge/bridge"
 	"github.com/mspgeek-community/matterbridge/bridge/config"
 	"github.com/mspgeek-community/matterbridge/bridge/helper"
 	"github.com/mspgeek-community/matterbridge/matterhook"
-	"github.com/matterbridge/matterclient"
 	"github.com/rs/xid"
 )
 
@@ -113,7 +114,7 @@ func (b *Bmattermost) JoinChannel(channel config.ChannelInfo) error {
 			return fmt.Errorf("Could not find channel ID for channel %s", channel.Name)
 		}
 
-		return b.mc.JoinChannel(id)
+		return b.mc.JoinChannel(context.TODO(), id)
 	}
 
 	return nil
@@ -146,7 +147,7 @@ func (b *Bmattermost) Send(msg config.Message) (string, error) {
 			return "", nil
 		}
 
-		return msg.ID, b.mc.DeleteMessage(msg.ID)
+		return msg.ID, b.mc.DeleteMessage(context.TODO(), msg.ID)
 	}
 
 	// Handle prefix hint for unthreaded messages.
@@ -157,7 +158,7 @@ func (b *Bmattermost) Send(msg config.Message) (string, error) {
 
 	// we only can reply to the root of the thread, not to a specific ID (like discord for example does)
 	if msg.ParentID != "" {
-		post, _, err := b.mc.Client.GetPost(msg.ParentID, "")
+		post, _, err := b.mc.Client.GetPost(context.TODO(), msg.ParentID, "")
 		if err != nil {
 			b.Log.Errorf("getting post %s failed: %s", msg.ParentID, err)
 		}
@@ -169,7 +170,7 @@ func (b *Bmattermost) Send(msg config.Message) (string, error) {
 	// Upload a file if it exists
 	if msg.Extra != nil {
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			if _, err := b.mc.PostMessage(b.getChannelID(rmsg.Channel), rmsg.Username+rmsg.Text, msg.ParentID); err != nil {
+			if _, err := b.mc.PostMessage(context.TODO(), b.getChannelID(rmsg.Channel), rmsg.Username+rmsg.Text, msg.ParentID); err != nil {
 				b.Log.Errorf("PostMessage failed: %s", err)
 			}
 		}
@@ -185,9 +186,9 @@ func (b *Bmattermost) Send(msg config.Message) (string, error) {
 
 	// Edit message if we have an ID
 	if msg.ID != "" {
-		return b.mc.EditMessage(msg.ID, msg.Text)
+		return b.mc.EditMessage(context.TODO(), msg.ID, msg.Text)
 	}
 
 	// Post normal message
-	return b.mc.PostMessage(b.getChannelID(msg.Channel), msg.Text, msg.ParentID)
+	return b.mc.PostMessage(context.TODO(), b.getChannelID(msg.Channel), msg.Text, msg.ParentID)
 }

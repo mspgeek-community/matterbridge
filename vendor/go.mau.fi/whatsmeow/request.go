@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -18,7 +17,7 @@ import (
 )
 
 func (cli *Client) generateRequestID() string {
-	return cli.uniqueID + strconv.FormatUint(uint64(atomic.AddUint32(&cli.idCounter, 1)), 10)
+	return cli.uniqueID + strconv.FormatUint(cli.idCounter.Add(1), 10)
 }
 
 var xmlStreamEndNode = &waBinary.Node{Tag: "xmlstreamend"}
@@ -69,7 +68,7 @@ func (cli *Client) cancelResponse(reqID string, ch chan *waBinary.Node) {
 	cli.responseWaitersLock.Unlock()
 }
 
-func (cli *Client) receiveResponse(data *waBinary.Node) bool {
+func (cli *Client) receiveResponse(ctx context.Context, data *waBinary.Node) bool {
 	id, ok := data.Attrs["id"].(string)
 	if !ok || (data.Tag != "iq" && data.Tag != "ack") {
 		return false
@@ -82,7 +81,10 @@ func (cli *Client) receiveResponse(data *waBinary.Node) bool {
 	}
 	delete(cli.responseWaiters, id)
 	cli.responseWaitersLock.Unlock()
-	waiter <- data
+	select {
+	case waiter <- data:
+	case <-ctx.Done():
+	}
 	return true
 }
 
@@ -99,14 +101,17 @@ type infoQuery struct {
 	To        types.JID
 	Target    types.JID
 	ID        string
-	Content   interface{}
+	SMaxID    string
+	Content   any
 
 	Timeout time.Duration
 	NoRetry bool
-	Context context.Context
 }
 
-func (cli *Client) sendIQAsyncAndGetData(query *infoQuery) (<-chan *waBinary.Node, []byte, error) {
+func (cli *Client) sendIQAsyncAndGetData(ctx context.Context, query *infoQuery) (<-chan *waBinary.Node, []byte, error) {
+	if cli == nil {
+		return nil, nil, ErrClientIsNil
+	}
 	if len(query.ID) == 0 {
 		query.ID = cli.generateRequestID()
 	}
@@ -116,13 +121,16 @@ func (cli *Client) sendIQAsyncAndGetData(query *infoQuery) (<-chan *waBinary.Nod
 		"xmlns": query.Namespace,
 		"type":  string(query.Type),
 	}
+	if query.SMaxID != "" {
+		attrs["smax_id"] = query.SMaxID
+	}
 	if !query.To.IsEmpty() {
 		attrs["to"] = query.To
 	}
 	if !query.Target.IsEmpty() {
 		attrs["target"] = query.Target
 	}
-	data, err := cli.sendNodeAndGetData(waBinary.Node{
+	data, err := cli.sendNodeAndGetData(ctx, waBinary.Node{
 		Tag:     "iq",
 		Attrs:   attrs,
 		Content: query.Content,
@@ -134,21 +142,20 @@ func (cli *Client) sendIQAsyncAndGetData(query *infoQuery) (<-chan *waBinary.Nod
 	return waiter, data, nil
 }
 
-func (cli *Client) sendIQAsync(query infoQuery) (<-chan *waBinary.Node, error) {
-	ch, _, err := cli.sendIQAsyncAndGetData(&query)
+func (cli *Client) sendIQAsync(ctx context.Context, query infoQuery) (<-chan *waBinary.Node, error) {
+	ch, _, err := cli.sendIQAsyncAndGetData(ctx, &query)
 	return ch, err
 }
 
-func (cli *Client) sendIQ(query infoQuery) (*waBinary.Node, error) {
-	resChan, data, err := cli.sendIQAsyncAndGetData(&query)
+const defaultRequestTimeout = 75 * time.Second
+
+func (cli *Client) sendIQ(ctx context.Context, query infoQuery) (*waBinary.Node, error) {
+	if query.Timeout == 0 {
+		query.Timeout = defaultRequestTimeout
+	}
+	resChan, data, err := cli.sendIQAsyncAndGetData(ctx, &query)
 	if err != nil {
 		return nil, err
-	}
-	if query.Timeout == 0 {
-		query.Timeout = 75 * time.Second
-	}
-	if query.Context == nil {
-		query.Context = context.Background()
 	}
 	select {
 	case res := <-resChan:
@@ -156,7 +163,7 @@ func (cli *Client) sendIQ(query infoQuery) (*waBinary.Node, error) {
 			if query.NoRetry {
 				return nil, &DisconnectedError{Action: "info query", Node: res}
 			}
-			res, err = cli.retryFrame("info query", query.ID, data, res, query.Context, query.Timeout)
+			res, err = cli.retryFrame(ctx, "info query", query.ID, data, res, query.Timeout)
 			if err != nil {
 				return nil, err
 			}
@@ -168,20 +175,27 @@ func (cli *Client) sendIQ(query infoQuery) (*waBinary.Node, error) {
 			return res, parseIQError(res)
 		}
 		return res, nil
-	case <-query.Context.Done():
-		return nil, query.Context.Err()
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-time.After(query.Timeout):
 		return nil, ErrIQTimedOut
 	}
 }
 
-func (cli *Client) retryFrame(reqType, id string, data []byte, origResp *waBinary.Node, ctx context.Context, timeout time.Duration) (*waBinary.Node, error) {
+func (cli *Client) retryFrame(
+	ctx context.Context,
+	reqType,
+	id string,
+	data []byte,
+	origResp *waBinary.Node,
+	timeout time.Duration,
+) (*waBinary.Node, error) {
 	if isAuthErrorDisconnect(origResp) {
-		cli.Log.Debugf("%s (%s) was interrupted by websocket disconnection (%s), not retrying as it looks like an auth error", id, reqType, origResp.XMLString())
+		cli.Log.Debugf("%s (%s) was interrupted by websocket disconnection (%s), not retrying as it looks like an auth error", id, reqType, origResp)
 		return nil, &DisconnectedError{Action: reqType, Node: origResp}
 	}
 
-	cli.Log.Debugf("%s (%s) was interrupted by websocket disconnection (%s), waiting for reconnect to retry...", id, reqType, origResp.XMLString())
+	cli.Log.Debugf("%s (%s) was interrupted by websocket disconnection (%s), waiting for reconnect to retry...", id, reqType, origResp)
 	if !cli.WaitForConnection(5 * time.Second) {
 		cli.Log.Debugf("Websocket didn't reconnect within 5 seconds of failed %s (%s)", reqType, id)
 		return nil, &DisconnectedError{Action: reqType, Node: origResp}
@@ -195,7 +209,7 @@ func (cli *Client) retryFrame(reqType, id string, data []byte, origResp *waBinar
 	}
 
 	respChan := cli.waitResponse(id)
-	err := sock.SendFrame(data)
+	err := sock.SendFrame(ctx, data)
 	if err != nil {
 		cli.cancelResponse(id, respChan)
 		return nil, err
@@ -214,7 +228,7 @@ func (cli *Client) retryFrame(reqType, id string, data []byte, origResp *waBinar
 		return nil, ErrIQTimedOut
 	}
 	if isDisconnectNode(resp) {
-		cli.Log.Debugf("Retrying %s %s was interrupted by websocket disconnection (%v), not retrying anymore", reqType, id, resp.XMLString())
+		cli.Log.Debugf("Retrying %s %s was interrupted by websocket disconnection (%s), not retrying anymore", reqType, id, resp)
 		return nil, &DisconnectedError{Action: fmt.Sprintf("%s (retry)", reqType), Node: resp}
 	}
 	return resp, nil

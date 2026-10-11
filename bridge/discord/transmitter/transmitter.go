@@ -284,16 +284,19 @@ func (t *Transmitter) assignHooksByAppID(hooks []*discordgo.Webhook, appID strin
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 
+	picked := 0
 	for _, wh := range hooks {
 		if wh.ApplicationID != appID {
 			continue
 		}
 
 		t.channelWebhooks[wh.ChannelID] = wh
+		picked++
 		t.Log.WithFields(log.Fields{
 			"id":      wh.ID,
 			"name":    wh.Name,
 			"channel": wh.ChannelID,
-		}).Println(logLine)
+		}).Debug(logLine)
 	}
+	t.Log.Infof("Using %d existing webhooks", picked)
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mspgeek-community/matterbridge/bridge/config"
+	"github.com/mspgeek-community/matterbridge/bridge/helper"
 	"github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
 )
@@ -102,7 +103,7 @@ func (b *Bslack) populateMessageWithBotInfo(ev *slack.MessageEvent, rmsg *config
 	var err error
 	var bot *slack.Bot
 	for {
-		bot, err = b.rtm.GetBotInfo(ev.BotID)
+		bot, err = b.rtm.GetBotInfo(slack.GetBotInfoParameters{Bot: ev.BotID})
 		if err == nil {
 			break
 		}
@@ -129,7 +130,7 @@ var (
 	channelRE        = regexp.MustCompile(`<#[a-zA-Z0-9]+\|(.+?)>`)
 	ChannelREAuto    = regexp.MustCompile(`<#[A-Z0-9]+\|>`)
 	variableRE       = regexp.MustCompile(`<!((?:subteam\^)?[a-zA-Z0-9]+)(?:\|@?(.+?))?>`)
-	urlRE            = regexp.MustCompile(`<([^<\|]+)\|([^>]+)>`)
+	urlRE            = regexp.MustCompile(`<([a-zA-Z][a-zA-Z0-9+.-]*:[^<>|\s]+)(?:\|([^>]*))?>`)
 	codeFenceRE      = regexp.MustCompile(`(?m)^` + "```" + `\w+$`)
 	topicOrPurposeRE = regexp.MustCompile(`(?s)(@.+) (cleared|set)(?: the)? channel (topic|purpose)(?:: (.*))?`)
 )
@@ -153,12 +154,57 @@ func (b *Bslack) extractTopicOrPurpose(text string) (string, string) {
 func (b *Bslack) replaceMention(text string) string {
 	replaceFunc := func(match string) string {
 		userID := strings.Trim(match, "@<>")
-		if username := b.users.getUsername(userID); userID != "" {
-			return "@" + strings.ReplaceAll(username, " ", "")
+		user := b.users.getUser(userID)
+		if user == nil {
+			return match
 		}
-		return match
+		// Carry all of the user's names so the destination can link the
+		// right person without guessing where the name ends.
+		return helper.UserRef(append([]string{slackDisplayName(user)}, userNames(user)...)...)
 	}
 	return mentionRE.ReplaceAllStringFunc(text, replaceFunc)
+}
+
+// slackDisplayName is the name Slack shows for a user.
+func slackDisplayName(user *slack.User) string {
+	switch {
+	case user.Profile.DisplayName != "":
+		return user.Profile.DisplayName
+	case user.RealName != "":
+		return user.RealName
+	}
+	return user.Name
+}
+
+// UserMention returns the Slack mention of the user with these names (a user
+// reference from another platform).
+func (b *Bslack) UserMention(names []string) (string, bool) {
+	if b.users == nil {
+		return "", false
+	}
+	b.users.usersMutex.RLock()
+	id, ok := helper.ResolveUserByNames(b.users.nameIndex, names)
+	b.users.usersMutex.RUnlock()
+	if !ok {
+		return "", false
+	}
+	return "<@" + id + ">", true
+}
+
+// replaceOutgoingMentions turns "@name" from other platforms into a Slack
+// mention when name matches a user's display name, real name or username
+// (ignoring case, spaces and punctuation).
+func (b *Bslack) replaceOutgoingMentions(text string) string {
+	if b.users == nil {
+		return text
+	}
+	return helper.ReplaceMentions(text, func(name string) (string, bool) {
+		id, ok := b.users.lookupByName(name)
+		if !ok {
+			return "", false
+		}
+		return "<@" + id + ">", true
+	})
 }
 
 // @see https://api.slack.com/docs/message-formatting#linking_to_channels_and_users
@@ -168,25 +214,20 @@ func (b *Bslack) replaceChannel(text string) string {
 	}
 	return text
 }
-func (b *Bslack) replaceChannelByName(text string) string {
-	for _, r := range ChannelREAuto.FindAllStringSubmatch(text, -1) {
-		channelIdOnly := strings.TrimSuffix(strings.TrimPrefix(r[0], "<#"), "|>")
-		channelName, err := b.channels.getChannelByID(channelIdOnly)
-		if err != nil {
-			continue
-		}
-		channelNameWithoutBrackets := strings.TrimPrefix(strings.TrimSuffix(channelName.Name, ">"), "<#")
-		matchedString := r[0]
-		text = strings.Replace(text, matchedString, "#"+channelNameWithoutBrackets, 1)
-		// Use the initialized dChannels from the Bslack struct
-		for _, channel := range b.dChannels {
-			if channelNameWithoutBrackets == channel.Name {
-				text = strings.Replace(text, "#"+channelNameWithoutBrackets, "<#"+channel.ID+">", 1)
-			}
-		}
-	}
 
-	return text
+// replaceChannelByName turns Slack channel links without a label ("<#C123|>")
+// into a channel reference carrying the exact Slack channel name. The gateway
+// turns it into the destination's channel link when the destination has a
+// channel with exactly that name (Discord), and into "#name" otherwise.
+func (b *Bslack) replaceChannelByName(text string) string {
+	return ChannelREAuto.ReplaceAllStringFunc(text, func(match string) string {
+		channelID := strings.TrimSuffix(strings.TrimPrefix(match, "<#"), "|>")
+		channel, err := b.channels.getChannelByID(channelID)
+		if err != nil {
+			return match
+		}
+		return helper.ChannelRef(channel.Name)
+	})
 }
 
 // @see https://api.slack.com/docs/message-formatting#variables
@@ -201,9 +242,30 @@ func (b *Bslack) replaceVariable(text string) string {
 	return text
 }
 
+// replaceURL converts Slack links, <url|label> and <url>, to Markdown. A link
+// whose label is just the URL becomes the plain URL so other platforms show
+// their normal link preview instead of a masked link.
 // @see https://api.slack.com/docs/message-formatting#linking_to_urls
 func (b *Bslack) replaceURL(text string) string {
-	return urlRE.ReplaceAllString(text, "[${2}](${1})")
+	return urlRE.ReplaceAllStringFunc(text, func(match string) string {
+		sub := urlRE.FindStringSubmatch(match)
+		url, label := sub[1], sub[2]
+		if label == "" || sameLink(url, label) {
+			return url
+		}
+		return "[" + label + "](" + url + ")"
+	})
+}
+
+// sameLink reports whether label only repeats url, as Slack does for links
+// typed into a message ("example.com/a" for "https://example.com/a").
+func sameLink(url, label string) bool {
+	norm := func(s string) string {
+		s = strings.TrimPrefix(strings.TrimPrefix(s, "https://"), "http://")
+		s = strings.TrimPrefix(s, "mailto:")
+		return strings.TrimSuffix(s, "/")
+	}
+	return norm(url) == norm(label)
 }
 
 func (b *Bslack) replaceb0rkedMarkDown(text string) string {

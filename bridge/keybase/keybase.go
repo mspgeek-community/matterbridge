@@ -98,7 +98,7 @@ func (b *Bkeybase) Send(msg config.Message) (string, error) {
 
 	// Send regular message
 	text := msg.Username + msg.Text
-	resp, err := b.kbc.SendMessageByTeamName(b.team, &b.channel, text)
+	resp, err := b.kbc.SendMessageByTeamName(b.team, &b.channel, "%s", text)
 	if err != nil {
 		return "", err
 	}

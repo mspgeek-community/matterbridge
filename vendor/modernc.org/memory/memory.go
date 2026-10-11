@@ -4,125 +4,72 @@
 
 // Package memory implements a memory allocator.
 //
-// Build status
+// # Build status
 //
 // available at https://modern-c.appspot.com/-/builder/?importpath=modernc.org%2fmemory
 //
-// Changelog
+// # Changelog
 //
 // 2017-10-03 Added alternative, unsafe.Pointer-based API.
 //
 // Package memory implements a memory allocator.
 //
-// Changelog
+// # Changelog
 //
 // 2017-10-03 Added alternative, unsafe.Pointer-based API.
 //
-// Benchmarks
+// # Page retention
 //
-// AMD Ryzen 9 3900X 12-Core Processor × 24
+// Memory is acquired from the OS in 64 KiB units or, for larger
+// allocations, in units rounded up to a power of two on 64-bit hosts.
+// An Allocator retains empty regions for reuse instead of unmapping
+// them as soon as their last slot is freed: each size class keeps its
+// current carve-target page, and beyond that, retired regions of any
+// size go into a pool bounded by 4 MiB plus the high-water mark of the
+// live mapping. An allocation pattern that repeatedly drains a size
+// class, or repeatedly frees and reallocates large buffers, no longer
+// pays a mmap/munmap round trip per turnover. Use Allocator.Trim to
+// hand the retained regions back.
 //
-//  jnml@3900x:~/src/modernc.org/memory$ date ; go version ; go test -run @ -bench . -benchmem |& tee log
-//  Fri Nov 20 17:23:04 CET 2020
-//  go version go1.15.5 linux/amd64
-//  goos: linux
-//  goarch: amd64
-//  pkg: modernc.org/memory
-//  BenchmarkFree16-24             	141188362	         8.26 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkFree32-24             	100000000	        11.4 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkFree64-24             	67160647	        18.3 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkCalloc16-24           	60612698	        19.8 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkCalloc32-24           	47968105	        23.8 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkCalloc64-24           	40752181	        28.6 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkGoCalloc16-24         	66487354	        17.8 ns/op	      16 B/op	       1 allocs/op
-//  BenchmarkGoCalloc32-24         	56009206	        21.2 ns/op	      32 B/op	       1 allocs/op
-//  BenchmarkGoCalloc64-24         	52086571	        23.4 ns/op	      64 B/op	       1 allocs/op
-//  BenchmarkMalloc16-24           	113943390	        10.2 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkMalloc32-24           	113520471	        10.2 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkMalloc64-24           	108787056	        10.7 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrFree16-24      	146110286	         7.94 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrFree32-24      	93052707	        12.0 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrFree64-24      	69805262	        17.3 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrCalloc16-24    	85282725	        13.7 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrCalloc32-24    	66489789	        17.9 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrCalloc64-24    	53561092	        22.7 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrMalloc16-24    	222978858	         5.28 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrMalloc32-24    	210443384	         5.30 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrMalloc64-24    	213706227	         5.47 ns/op	       0 B/op	       0 allocs/op
-//  PASS
-//  ok  	modernc.org/memory	70.528s
-//  jnml@3900x:~/src/modernc.org/memory$
+// # Benchmarks
 //
-// Intel® Core™ i5-4670 CPU @ 3.40GHz × 4
-//
-//  ==== jnml@4670:~/src/modernc.org/memory> date ; go version ; go test -run @ -bench . -benchmem |& tee log
-//  Sat Dec  8 12:56:53 CET 2018
-//  go version go1.11.2 linux/amd64
-//  goos: linux
-//  goarch: amd64
-//  pkg: modernc.org/memory
-//  BenchmarkFree16-4            	100000000	        14.7 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkFree32-4            	100000000	        20.5 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkFree64-4            	50000000	        32.8 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkCalloc16-4          	50000000	        24.4 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkCalloc32-4          	50000000	        29.2 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkCalloc64-4          	50000000	        35.7 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkGoCalloc16-4        	50000000	        27.0 ns/op	      16 B/op	       1 allocs/op
-//  BenchmarkGoCalloc32-4        	50000000	        27.3 ns/op	      32 B/op	       1 allocs/op
-//  BenchmarkGoCalloc64-4        	30000000	        37.9 ns/op	      64 B/op	       1 allocs/op
-//  BenchmarkMalloc16-4          	100000000	        12.9 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkMalloc32-4          	100000000	        12.9 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkMalloc64-4          	100000000	        13.2 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrFree16-4     	100000000	        12.0 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrFree32-4     	100000000	        17.5 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrFree64-4     	50000000	        28.9 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrCalloc16-4   	100000000	        17.8 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrCalloc32-4   	100000000	        22.9 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrCalloc64-4   	50000000	        29.6 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrMalloc16-4   	200000000	         7.31 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrMalloc32-4   	200000000	         7.47 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrMalloc64-4   	200000000	         7.68 ns/op	       0 B/op	       0 allocs/op
-//  PASS
-//  ok  	modernc.org/memory	73.859s
-//  //
-// Intel® Xeon(R) CPU E5-1650 v2 @ 3.50GHz × 12
-//
-//  ==== jnml@e5-1650:~/src/modernc.org/memory> date ; go version ; go test -run @ -bench . -benchmem
-//  Fri Dec  7 14:18:50 CET 2018
-//  go version go1.11.2 linux/amd64
-//  goos: linux
-//  goarch: amd64
-//  pkg: modernc.org/memory
-//  BenchmarkFree16-12             	100000000	        16.7 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkFree32-12             	50000000	        25.0 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkFree64-12             	30000000	        39.7 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkCalloc16-12           	50000000	        26.3 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkCalloc32-12           	50000000	        33.4 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkCalloc64-12           	30000000	        38.3 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkGoCalloc16-12         	50000000	        26.6 ns/op	      16 B/op	       1 allocs/op
-//  BenchmarkGoCalloc32-12         	50000000	        26.8 ns/op	      32 B/op	       1 allocs/op
-//  BenchmarkGoCalloc64-12         	30000000	        35.1 ns/op	      64 B/op	       1 allocs/op
-//  BenchmarkMalloc16-12           	100000000	        13.5 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkMalloc32-12           	100000000	        13.4 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkMalloc64-12           	100000000	        14.1 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrFree16-12      	100000000	        14.4 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrFree32-12      	100000000	        21.7 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrFree64-12      	50000000	        36.7 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrCalloc16-12    	100000000	        20.4 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrCalloc32-12    	50000000	        27.1 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrCalloc64-12    	50000000	        33.4 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrMalloc16-12    	200000000	         8.02 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrMalloc32-12    	200000000	         8.28 ns/op	       0 B/op	       0 allocs/op
-//  BenchmarkUintptrMalloc64-12    	200000000	         8.29 ns/op	       0 B/op	       0 allocs/op
-//  PASS
-//  ok  	modernc.org/memory	80.896s
+//	jnml@3900x:~/src/modernc.org/memory$ date ; go version ; go test -run @ -bench . -benchmem |& tee log
+//	Mon Sep 25 16:02:02 CEST 2023
+//	go version go1.21.1 linux/amd64
+//	goos: linux
+//	goarch: amd64
+//	pkg: modernc.org/memory
+//	cpu: AMD Ryzen 9 3900X 12-Core Processor
+//	BenchmarkFree16-24             	123506772	         9.802 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkFree32-24             	73853230	        15.08 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkFree64-24             	43070334	        25.15 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkCalloc16-24           	59353304	        18.92 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkCalloc32-24           	39415004	        29.00 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkCalloc64-24           	35825725	        32.02 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkGoCalloc16-24         	38274313	        26.99 ns/op	      16 B/op	       1 allocs/op
+//	BenchmarkGoCalloc32-24         	44590477	        33.06 ns/op	      32 B/op	       1 allocs/op
+//	BenchmarkGoCalloc64-24         	44233016	        37.20 ns/op	      64 B/op	       1 allocs/op
+//	BenchmarkMalloc16-24           	145736911	         7.720 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkMalloc32-24           	128898334	         7.887 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkMalloc64-24           	149569483	         7.994 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkUintptrFree16-24      	117043012	         9.205 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkUintptrFree32-24      	77399617	        14.20 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkUintptrFree64-24      	48770785	        25.04 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkUintptrCalloc16-24    	79257636	        15.44 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkUintptrCalloc32-24    	49644562	        23.62 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkUintptrCalloc64-24    	39854710	        28.22 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkUintptrMalloc16-24    	252987727	         4.525 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkUintptrMalloc32-24    	241423840	         4.433 ns/op	       0 B/op	       0 allocs/op
+//	BenchmarkUintptrMalloc64-24    	256450324	         4.669 ns/op	       0 B/op	       0 allocs/op
+//	PASS
+//	ok  	modernc.org/memory	93.178s
+//	jnml@3900x:~/src/modernc.org/memory$
 package memory // import "modernc.org/memory"
 
 import (
 	"fmt"
 	"math/bits"
 	"os"
-	"reflect"
 	"unsafe"
 )
 
@@ -159,22 +106,132 @@ type page struct {
 // Allocator allocates and frees memory. Its zero value is ready for use.  The
 // exported counters are updated only when build tag memory.counters is
 // present.
+//
+// An Allocator retains empty regions for reuse, see Trim.
 type Allocator struct {
-	Allocs int // # of allocs.
-	Bytes  int // Asked from OS.
-	cap    [64]int
-	lists  [64]uintptr          // *node
-	Mmaps  int                  // Asked from OS.
-	pages  [64]uintptr          // *page
-	regs   map[uintptr]struct{} // map[*page]struct{}
+	Allocs    int // # of allocs.
+	Bytes     int // Asked from OS.
+	cap       [64]int
+	lists     [64]uintptr          // *node
+	Mmaps     int                  // Asked from OS.
+	pages     [64]uintptr          // *page
+	regs      map[uintptr]struct{} // map[*page]struct{}
+	freed     map[int][]uintptr    // empty regions retained for reuse, keyed by region size
+	freedSize int                  // total bytes in freed
+	cold      map[int]int          // the bottom cold[size] regions of freed[size] are decommitted
+	live      int                  // bytes mapped and not in freed
+	hiLive    int                  // high-water mark of live
 }
 
+// maxFreedSize returns the bound on the total bytes retained in
+// a.freed: a fixed floor plus the high-water mark of the live mapping.
+// The high-water mark rather than the current live size matters for
+// large transient buffers: when one is freed, live has already shrunk
+// by the buffer, and it is exactly the region most worth retaining.
+func (a *Allocator) maxFreedSize() int { return 4<<20 + a.hiLive }
+
+// addLive adds n bytes to the live mapping size, tracking its
+// high-water mark.
+func (a *Allocator) addLive(n int) {
+	a.live += n
+	if a.live > a.hiLive {
+		a.hiLive = a.live
+	}
+}
+
+// canRetain reports whether a.freed has room to retain size more bytes.
+func (a *Allocator) canRetain(size int) bool { return a.freedSize+size <= a.maxFreedSize() }
+
+// mmapSize returns the region size class that backs a request for size
+// bytes: requests up to pageSize share the single pageSize class, and
+// on 64-bit larger requests are rounded up to a power of two. The
+// extra address space is never touched and so costs nothing, and
+// collapsing sizes into classes makes reuse via a.freed much more
+// likely.
+//
+// Classes are multiples of mmapGranularity - the granularity the platform
+// mmap actually maps at - so the class of a request agrees with the
+// page.size the mapping comes back with, which is what retain later keys
+// the pool by. Rounding to anything finer describes a mapping the platform
+// cannot make: on windows/386 a 1 MiB+1 request rounded to OS pages misses
+// forever the 1 MiB+64 KiB region its own mapping put into the pool.
+func mmapSize(size int) int {
+	switch {
+	case size <= pageSize && pageSize%osPageSize == 0:
+		return pageSize
+	case size > pageSize && bits.UintSize == 64:
+		return roundup(1<<bits.Len(uint(size-1)), mmapGranularity)
+	default:
+		return roundup(size, mmapGranularity)
+	}
+}
+
+// slabBatch is how many pageSize regions a single mapping acquires
+// when a pageSize region is needed and the pool is empty.
+const slabBatch = 16
+
 func (a *Allocator) mmap(size int) (uintptr /* *page */, error) {
+	size = mmapSize(size)
+	if s := a.freed[size]; len(s) != 0 {
+		p := s[len(s)-1]
+		if canDecommit {
+			if c := a.cold[size]; c >= len(s) { // popping from the decommitted prefix
+				if err := recommit(p, size); err != nil {
+					return 0, err // pool left untouched
+				}
+
+				a.cold[size] = len(s) - 1
+			}
+		}
+		a.freed[size] = s[:len(s)-1]
+		a.freedSize -= size
+		a.addLive(size)
+		pg := (*page)(unsafe.Pointer(p))
+		pg.brk = 0
+		pg.used = 0
+		return p, nil
+	}
+
+	// Aligning a fresh mapping to a pageSize boundary costs up to two
+	// munmap calls for the trimmed-off ends, so when a single pageSize
+	// region is needed, acquire a batch in one mapping and put the
+	// rest into the pool: three syscalls amortized over slabBatch
+	// regions instead of per region.
+	if canCarve && size == pageSize {
+		if p, n, err := mmap(slabBatch * pageSize); err == nil {
+			if n%pageSize == 0 && a.canRetain(n-pageSize) {
+				for off := pageSize; off < n; off += pageSize {
+					q := p + uintptr(off)
+					a.reg(q, pageSize)
+					a.retain(q, pageSize)
+				}
+				return a.reg(p, pageSize), nil
+			}
+
+			if err := unmap(p, n); err != nil {
+				return 0, err
+			}
+		}
+		// Fall through and map a single region.
+	}
+
 	p, size, err := mmap(size)
 	if err != nil {
 		return 0, err
 	}
 
+	//TODO(jnml) The returned size may now be nearly as twice as large as we asked
+	//for. Use that extra capacity. For that we need to move the respective
+	//Allocator.cap item into the page struct so the page cap becomes dynamic.
+	//
+	// Related: This is a consequence of fixing the bigsort.test failures on
+	// linux/s390x, see: https://gitlab.com/cznic/sqlite/-/issues/207
+	return a.reg(p, size), nil
+}
+
+// reg registers the freshly mapped size-byte region at p.
+func (a *Allocator) reg(p uintptr, size int) uintptr {
+	a.addLive(size)
 	if counters {
 		a.Mmaps++
 		a.Bytes += size
@@ -184,7 +241,7 @@ func (a *Allocator) mmap(size int) (uintptr /* *page */, error) {
 	}
 	(*page)(unsafe.Pointer(p)).size = size
 	a.regs[p] = struct{}{}
-	return p, nil
+	return p
 }
 
 func (a *Allocator) newPage(size int) (uintptr /* *page */, error) {
@@ -215,10 +272,67 @@ func (a *Allocator) newSharedPage(log uint) (uintptr /* *page */, error) {
 
 func (a *Allocator) unmap(p uintptr /* *page */) error {
 	delete(a.regs, p)
+	size := (*page)(unsafe.Pointer(p)).size
 	if counters {
 		a.Mmaps--
+		a.Bytes -= size
 	}
-	return unmap(p, (*page)(unsafe.Pointer(p)).size)
+	return unmap(p, size)
+}
+
+// release retires the empty region at p: it is retained in a.freed for
+// reuse, unless the retained total is at its bound, in which case the
+// region is returned to the OS. Retained regions stay in a.regs and in
+// the counters; Trim and Close return them to the OS.
+func (a *Allocator) release(p uintptr /* *page */) error {
+	size := (*page)(unsafe.Pointer(p)).size
+	if a.canRetain(size) {
+		a.retain(p, size)
+		return nil
+	}
+
+	a.live -= size
+	return a.unmap(p)
+}
+
+// hotBytes is how much of the retained pool stays committed per size class.
+// 4 MiB costs nothing measurable against not decommitting at all (speedtest1
+// and production simulations) while returning the hoard above it.
+const hotBytes = 4 << 20
+
+// retain puts the empty size-byte region at p into a.freed.
+func (a *Allocator) retain(p uintptr, size int) {
+	if a.freed == nil {
+		a.freed = map[int][]uintptr{}
+	}
+	a.freed[size] = append(a.freed[size], p)
+	a.freedSize += size
+	a.live -= size
+	if !canDecommit {
+		return
+	}
+
+	// Keep the newest hotBytes worth of this class committed: those are the
+	// regions a churning workload takes straight back, where decommitting only
+	// buys a page fault. What falls out of that window is hoard - it is holding
+	// a resident set the workload has stopped using - so hand its pages back
+	// while keeping the mapping.
+	//
+	// a.cold counts the stack's already-decommitted bottom, so only a region
+	// newly falling out of the hot window pays a syscall: a pool oscillating
+	// around the boundary would otherwise re-madvise the same region on every
+	// retain.
+	hot := hotBytes / size
+	if hot < 1 {
+		hot = 1
+	}
+	if s := a.freed[size]; len(s)-a.cold[size] > hot {
+		if a.cold == nil {
+			a.cold = map[int]int{}
+		}
+		decommit(s[a.cold[size]], size)
+		a.cold[size]++
+	}
 }
 
 // UintptrCalloc is like Calloc except it returns an uintptr.
@@ -256,10 +370,7 @@ func (a *Allocator) UintptrFree(p uintptr) (err error) {
 	pg := p &^ uintptr(pageMask)
 	log := (*page)(unsafe.Pointer(pg)).log
 	if log == 0 {
-		if counters {
-			a.Bytes -= (*page)(unsafe.Pointer(pg)).size
-		}
-		return a.unmap(pg)
+		return a.release(pg)
 	}
 
 	(*node)(unsafe.Pointer(p)).prev = 0
@@ -291,13 +402,17 @@ func (a *Allocator) UintptrFree(p uintptr) (err error) {
 		}
 	}
 
-	if a.pages[log] == pg {
-		a.pages[log] = 0
+	// The page is now empty. Retain it as the carve target of its size class
+	// rather than returning it to the OS, unless the class already has one.
+	// Otherwise a pattern that repeatedly drains the class pays a mmap/munmap
+	// round trip per turnover. Trim releases the pages retained this way.
+	if a.pages[log] == 0 || a.pages[log] == pg {
+		(*page)(unsafe.Pointer(pg)).brk = 0
+		a.pages[log] = pg
+		return nil
 	}
-	if counters {
-		a.Bytes -= (*page)(unsafe.Pointer(pg)).size
-	}
-	return a.unmap(pg)
+
+	return a.release(pg)
 }
 
 // UintptrMalloc is like Malloc except it returns an uinptr.
@@ -313,6 +428,9 @@ func (a *Allocator) UintptrMalloc(size int) (r uintptr, err error) {
 
 	if size == 0 {
 		return 0, nil
+	}
+	if size > int(^uint(0)>>1)-int(headerSize) {
+		return 0, fmt.Errorf("memory: allocation size %d is too large", size)
 	}
 
 	if counters {
@@ -370,7 +488,7 @@ func (a *Allocator) UintptrRealloc(p uintptr, size int) (r uintptr, err error) {
 	}
 
 	us := UintptrUsableSize(p)
-	if us > size {
+	if us >= size {
 		return p, nil
 	}
 
@@ -417,12 +535,7 @@ func (a *Allocator) Calloc(size int) (r []byte, err error) {
 		return nil, err
 	}
 
-	var b []byte
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&b))
-	sh.Cap = usableSize(p)
-	sh.Data = p
-	sh.Len = size
-	return b, nil
+	return (*rawmem)(unsafe.Pointer(p))[:size:usableSize(p)], nil
 }
 
 // Close releases all OS resources used by a and sets it to its zero value.
@@ -461,11 +574,7 @@ func (a *Allocator) Malloc(size int) (r []byte, err error) {
 		return nil, err
 	}
 
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&r))
-	sh.Cap = usableSize(p)
-	sh.Data = p
-	sh.Len = size
-	return r, nil
+	return (*rawmem)(unsafe.Pointer(p))[:size:usableSize(p)], nil
 }
 
 // Realloc changes the size of the backing array of b to size bytes or returns
@@ -487,11 +596,45 @@ func (a *Allocator) Realloc(b []byte, size int) (r []byte, err error) {
 		return nil, err
 	}
 
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&r))
-	sh.Cap = usableSize(p)
-	sh.Data = p
-	sh.Len = size
-	return r, nil
+	return (*rawmem)(unsafe.Pointer(p))[:size:usableSize(p)], nil
+}
+
+// Trim returns to the OS the empty regions a retains for reuse: each
+// size class's empty carve-target page and the bounded pool of retired
+// regions. Pages still having live allocations are not affected and a
+// stays ready for use.
+//
+// Trim is never necessary for correctness. It trades a smaller resident set
+// now for the cost of mapping those pages again later.
+func (a *Allocator) Trim() (err error) {
+	if trace {
+		defer func() {
+			fmt.Fprintf(os.Stderr, "Trim() %v\n", err)
+		}()
+	}
+	for log := range a.pages {
+		pg := a.pages[log]
+		if pg == 0 || (*page)(unsafe.Pointer(pg)).used != 0 {
+			continue
+		}
+
+		a.pages[log] = 0
+		a.live -= (*page)(unsafe.Pointer(pg)).size
+		if e := a.unmap(pg); e != nil && err == nil {
+			err = e
+		}
+	}
+	for _, s := range a.freed {
+		for _, pg := range s {
+			if e := a.unmap(pg); e != nil && err == nil {
+				err = e
+			}
+		}
+	}
+	a.freed = nil
+	a.freedSize = 0
+	a.cold = nil
+	return err
 }
 
 // UsableSize reports the size of the memory block allocated at p, which must

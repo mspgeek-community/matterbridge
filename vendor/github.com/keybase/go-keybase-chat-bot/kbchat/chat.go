@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/keybase/go-keybase-chat-bot/kbchat/types/chat1"
-	"github.com/keybase/go-keybase-chat-bot/kbchat/types/keybase1"
 )
 
 type Thread struct {
@@ -24,14 +23,14 @@ type sendMessageBody struct {
 }
 
 type sendMessageOptions struct {
-	Channel          chat1.ChatChannel `json:"channel,omitempty"`
+	Channel          chat1.ChatChannel `json:"channel"`
 	ConversationID   chat1.ConvIDStr   `json:"conversation_id,omitempty"`
-	Message          sendMessageBody   `json:",omitempty"`
-	Filename         string            `json:"filename,omitempty"`
-	Title            string            `json:"title,omitempty"`
-	MsgID            chat1.MessageID   `json:"message_id,omitempty"`
-	ConfirmLumenSend bool              `json:"confirm_lumen_send"`
-	ReplyTo          *chat1.MessageID  `json:"reply_to,omitempty"`
+	Message          sendMessageBody
+	Filename         string           `json:"filename,omitempty"`
+	Title            string           `json:"title,omitempty"`
+	MsgID            chat1.MessageID  `json:"message_id,omitempty"`
+	ConfirmLumenSend bool             `json:"confirm_lumen_send"`
+	ReplyTo          *chat1.MessageID `json:"reply_to,omitempty"`
 }
 
 type sendMessageParams struct {
@@ -50,6 +49,16 @@ func newSendArg(options sendMessageOptions) sendMessageArg {
 			Options: options,
 		},
 	}
+}
+
+// fmtBody skips Sprintf when no args are provided, so callers that pass untrusted
+// text as body without any args are safe. Callers that do pass args must still ensure
+// body is a trusted format string.
+func fmtBody(body string, args ...any) string {
+	if len(args) > 0 {
+		return fmt.Sprintf(body, args...)
+	}
+	return body
 }
 
 // GetConversations reads all conversations from the current user's inbox.
@@ -92,13 +101,13 @@ func (a *API) GetConversation(convID chat1.ConvIDStr) (res chat1.ConvSummary, er
 }
 
 // GetTextMessages fetches all text messages from a given channel. Optionally can filter
-// ont unread status.
+// on unread status.
 func (a *API) GetTextMessages(channel chat1.ChatChannel, unreadOnly bool) ([]chat1.MsgSummary, error) {
 	channelBytes, err := json.Marshal(channel)
 	if err != nil {
 		return nil, err
 	}
-	apiInput := fmt.Sprintf(`{"method": "read", "params": {"options": {"channel": %s}}}`, channelBytes)
+	apiInput := fmt.Sprintf(`{"method": "read", "params": {"options": {"channel": %s, "unread_only": %v}}}`, channelBytes, unreadOnly)
 	output, err := a.doFetch(apiInput)
 	if err != nil {
 		return nil, err
@@ -122,50 +131,50 @@ func (a *API) GetTextMessages(channel chat1.ChatChannel, unreadOnly bool) ([]cha
 	return res, nil
 }
 
-func (a *API) SendMessage(channel chat1.ChatChannel, body string, args ...interface{}) (resp SendResponse, err error) {
+func (a *API) SendMessage(channel chat1.ChatChannel, body string, args ...any) (resp SendResponse, err error) {
 	defer a.Trace(&err, "SendMessage")()
 	arg := newSendArg(sendMessageOptions{
 		Channel: channel,
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 	})
 	return a.doSend(arg)
 }
 
-func (a *API) Broadcast(body string, args ...interface{}) (SendResponse, error) {
+func (a *API) Broadcast(body string, args ...any) (SendResponse, error) {
 	return a.SendMessage(chat1.ChatChannel{
 		Name:   a.GetUsername(),
 		Public: true,
-	}, fmt.Sprintf(body, args...))
+	}, body, args...)
 }
 
-func (a *API) SendMessageByConvID(convID chat1.ConvIDStr, body string, args ...interface{}) (resp SendResponse, err error) {
+func (a *API) SendMessageByConvID(convID chat1.ConvIDStr, body string, args ...any) (resp SendResponse, err error) {
 	defer a.Trace(&err, "SendMessageByConvID")()
 	arg := newSendArg(sendMessageOptions{
 		ConversationID: convID,
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 	})
 	return a.doSend(arg)
 }
 
 // SendMessageByTlfName sends a message on the given TLF name
-func (a *API) SendMessageByTlfName(tlfName string, body string, args ...interface{}) (resp SendResponse, err error) {
+func (a *API) SendMessageByTlfName(tlfName string, body string, args ...any) (resp SendResponse, err error) {
 	defer a.Trace(&err, "SendMessageByTlfName")()
 	arg := newSendArg(sendMessageOptions{
 		Channel: chat1.ChatChannel{
 			Name: tlfName,
 		},
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 	})
 	return a.doSend(arg)
 }
 
-func (a *API) SendMessageByTeamName(teamName string, inChannel *string, body string, args ...interface{}) (resp SendResponse, err error) {
+func (a *API) SendMessageByTeamName(teamName string, inChannel *string, body string, args ...any) (resp SendResponse, err error) {
 	defer a.Trace(&err, "SendMessageByTeamName")()
 	channel := "general"
 	if inChannel != nil {
@@ -178,41 +187,41 @@ func (a *API) SendMessageByTeamName(teamName string, inChannel *string, body str
 			TopicName:   channel,
 		},
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 	})
 	return a.doSend(arg)
 }
 
-func (a *API) SendReply(channel chat1.ChatChannel, replyTo *chat1.MessageID, body string, args ...interface{}) (SendResponse, error) {
+func (a *API) SendReply(channel chat1.ChatChannel, replyTo *chat1.MessageID, body string, args ...any) (SendResponse, error) {
 	arg := newSendArg(sendMessageOptions{
 		Channel: channel,
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 		ReplyTo: replyTo,
 	})
 	return a.doSend(arg)
 }
 
-func (a *API) SendReplyByConvID(convID chat1.ConvIDStr, replyTo *chat1.MessageID, body string, args ...interface{}) (SendResponse, error) {
+func (a *API) SendReplyByConvID(convID chat1.ConvIDStr, replyTo *chat1.MessageID, body string, args ...any) (SendResponse, error) {
 	arg := newSendArg(sendMessageOptions{
 		ConversationID: convID,
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 		ReplyTo: replyTo,
 	})
 	return a.doSend(arg)
 }
 
-func (a *API) SendReplyByTlfName(tlfName string, replyTo *chat1.MessageID, body string, args ...interface{}) (SendResponse, error) {
+func (a *API) SendReplyByTlfName(tlfName string, replyTo *chat1.MessageID, body string, args ...any) (SendResponse, error) {
 	arg := newSendArg(sendMessageOptions{
 		Channel: chat1.ChatChannel{
 			Name: tlfName,
 		},
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 		ReplyTo: replyTo,
 	})
@@ -418,35 +427,35 @@ func (a *API) LeaveChannel(teamName string, channelName string) (chat1.EmptyRes,
 // Send lumens in chat /////////////////////////////////
 ////////////////////////////////////////////////////////
 
-func (a *API) InChatSend(channel chat1.ChatChannel, body string, args ...interface{}) (SendResponse, error) {
+func (a *API) InChatSend(channel chat1.ChatChannel, body string, args ...any) (SendResponse, error) {
 	arg := newSendArg(sendMessageOptions{
 		Channel: channel,
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 		ConfirmLumenSend: true,
 	})
 	return a.doSend(arg)
 }
 
-func (a *API) InChatSendByConvID(convID chat1.ConvIDStr, body string, args ...interface{}) (SendResponse, error) {
+func (a *API) InChatSendByConvID(convID chat1.ConvIDStr, body string, args ...any) (SendResponse, error) {
 	arg := newSendArg(sendMessageOptions{
 		ConversationID: convID,
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 		ConfirmLumenSend: true,
 	})
 	return a.doSend(arg)
 }
 
-func (a *API) InChatSendByTlfName(tlfName string, body string, args ...interface{}) (SendResponse, error) {
+func (a *API) InChatSendByTlfName(tlfName string, body string, args ...any) (SendResponse, error) {
 	arg := newSendArg(sendMessageOptions{
 		Channel: chat1.ChatChannel{
 			Name: tlfName,
 		},
 		Message: sendMessageBody{
-			Body: fmt.Sprintf(body, args...),
+			Body: fmtBody(body, args...),
 		},
 		ConfirmLumenSend: true,
 	})
@@ -501,7 +510,7 @@ type clearCmdsParams struct {
 
 type clearCmdsArg struct {
 	Method string          `json:"method"`
-	Params clearCmdsParams `json:"params,omitempty"`
+	Params clearCmdsParams `json:"params"`
 }
 
 func (a *API) ClearCommands(filter *chat1.ClearCommandAPIParam) error {
@@ -517,7 +526,7 @@ func (a *API) ClearCommands(filter *chat1.ClearCommandAPIParam) error {
 }
 
 type listCmdsOptions struct {
-	Channel        chat1.ChatChannel `json:"channel,omitempty"`
+	Channel        chat1.ChatChannel `json:"channel"`
 	ConversationID chat1.ConvIDStr   `json:"conversation_id,omitempty"`
 }
 
@@ -572,7 +581,7 @@ func (a *API) listCommands(arg listCmdsArg) ([]chat1.UserBotCommandOutput, error
 }
 
 type listMembersOptions struct {
-	Channel        chat1.ChatChannel `json:"channel,omitempty"`
+	Channel        chat1.ChatChannel `json:"channel"`
 	ConversationID chat1.ConvIDStr   `json:"conversation_id,omitempty"`
 }
 
@@ -585,6 +594,11 @@ type listMembersArg struct {
 	Params listMembersParams
 }
 
+type ListMembersResult struct {
+	Result chat1.ChatMembersDetails `json:"result"`
+	Error  *Error                   `json:"error,omitempty"`
+}
+
 func newListMembersArg(options listMembersOptions) listMembersArg {
 	return listMembersArg{
 		Method: "listmembers",
@@ -594,21 +608,21 @@ func newListMembersArg(options listMembersOptions) listMembersArg {
 	}
 }
 
-func (a *API) ListMembers(channel chat1.ChatChannel) (keybase1.TeamMembersDetails, error) {
+func (a *API) ListMembers(channel chat1.ChatChannel) (chat1.ChatMembersDetails, error) {
 	arg := newListMembersArg(listMembersOptions{
 		Channel: channel,
 	})
 	return a.listMembers(arg)
 }
 
-func (a *API) ListMembersByConvID(conversationID chat1.ConvIDStr) (keybase1.TeamMembersDetails, error) {
+func (a *API) ListMembersByConvID(conversationID chat1.ConvIDStr) (chat1.ChatMembersDetails, error) {
 	arg := newListMembersArg(listMembersOptions{
 		ConversationID: conversationID,
 	})
 	return a.listMembers(arg)
 }
 
-func (a *API) listMembers(arg listMembersArg) (res keybase1.TeamMembersDetails, err error) {
+func (a *API) listMembers(arg listMembersArg) (res chat1.ChatMembersDetails, err error) {
 	bArg, err := json.Marshal(arg)
 	if err != nil {
 		return res, err
@@ -617,15 +631,15 @@ func (a *API) listMembers(arg listMembersArg) (res keybase1.TeamMembersDetails, 
 	if err != nil {
 		return res, err
 	}
-	members := ListTeamMembers{}
+	members := ListMembersResult{}
 	err = json.Unmarshal(output, &members)
 	if err != nil {
 		return res, UnmarshalError{err}
 	}
-	if members.Error.Message != "" {
+	if members.Error != nil {
 		return res, members.Error
 	}
-	return members.Result.Members, nil
+	return members.Result, nil
 }
 
 type GetMessagesResult struct {
@@ -636,7 +650,7 @@ type GetMessagesResult struct {
 }
 
 type getMessagesOptions struct {
-	Channel        chat1.ChatChannel `json:"channel,omitempty"`
+	Channel        chat1.ChatChannel `json:"channel"`
 	ConversationID chat1.ConvIDStr   `json:"conversation_id,omitempty"`
 	MessageIDs     []chat1.MessageID `json:"message_ids,omitempty"`
 }

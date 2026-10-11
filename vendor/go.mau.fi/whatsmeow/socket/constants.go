@@ -26,13 +26,13 @@ const (
 const (
 	NoiseStartPattern = "Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00"
 
-	WAMagicValue = 5
+	WAMagicValue = 6
 )
 
 var WAConnHeader = []byte{'W', 'A', WAMagicValue, token.DictVersion}
 
 const (
-	FrameMaxSize    = 2 << 23
+	FrameMaxSize    = 1 << 24
 	FrameLengthSize = 3
 )
 
@@ -40,4 +40,10 @@ var (
 	ErrFrameTooLarge     = errors.New("frame too large")
 	ErrSocketClosed      = errors.New("frame socket is closed")
 	ErrSocketAlreadyOpen = errors.New("frame socket is already open")
+	ErrDialFailed        = errors.New("failed to dial whatsapp web websocket")
 )
+
+type ErrWithStatusCode struct {
+	error
+	StatusCode int
+}

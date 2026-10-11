@@ -5,10 +5,11 @@
 package edwards25519
 
 // This file contains additional functionality that is not included in the
-// upstream crypto/ed25519/internal/edwards25519 package.
+// upstream crypto/internal/edwards25519 package.
 
 import (
 	"errors"
+	"slices"
 
 	"filippo.io/edwards25519/field"
 )
@@ -79,6 +80,12 @@ func isOnCurve(X, Y, Z, T *field.Element) bool {
 // Note that BytesMontgomery only encodes the u-coordinate, so v and -v encode
 // to the same value. If v is the identity point, BytesMontgomery returns 32
 // zero bytes, analogously to the X25519 function.
+//
+// The lack of an inverse operation (such as SetMontgomeryBytes) is deliberate:
+// while every valid edwards25519 point has a unique u-coordinate Montgomery
+// encoding, X25519 accepts inputs on the quadratic twist, which don't correspond
+// to any edwards25519 point, and every other X25519 input corresponds to two
+// edwards25519 points.
 func (v *Point) BytesMontgomery() []byte {
 	// This function is outlined to make the allocations inline in the caller
 	// rather than happen on the heap.
@@ -94,13 +101,15 @@ func (v *Point) bytesMontgomery(buf *[32]byte) []byte {
 	//
 	//              u = (1 + y) / (1 - y)
 	//
-	// where y = Y / Z.
+	// where y = Y / Z and therefore
+	//
+	//              u = (Z + Y) / (Z - Y)
 
-	var y, recip, u field.Element
+	var n, r, u field.Element
 
-	y.Multiply(&v.y, y.Invert(&v.z))        // y = Y / Z
-	recip.Invert(recip.Subtract(feOne, &y)) // r = 1/(1 - y)
-	u.Multiply(u.Add(feOne, &y), &recip)    // u = (1 + y)*r
+	n.Add(&v.z, &v.y)                // n = Z + Y
+	r.Invert(r.Subtract(&v.z, &v.y)) // r = 1 / (Z - Y)
+	u.Multiply(&n, &r)               // u = n * r
 
 	return copyFieldElement(buf, &u)
 }
@@ -118,7 +127,7 @@ func (v *Point) MultByCofactor(p *Point) *Point {
 	return v.fromP1xP1(&result)
 }
 
-// Given k > 0, set s = s**(2*i).
+// Given k > 0, set s = s**(2*k).
 func (s *Scalar) pow2k(k int) {
 	for i := 0; i < k; i++ {
 		s.Multiply(s, s)
@@ -137,7 +146,7 @@ func (s *Scalar) Invert(t *Scalar) *Scalar {
 	for i := 0; i < 7; i++ {
 		table[i+1].Multiply(&table[i], &tt)
 	}
-	// Now table = [t**1, t**3, t**7, t**11, t**13, t**15]
+	// Now table = [t**1, t**3, t**5, t**7, t**9, t**11, t**13, t**15]
 	// so t**k = t[k/2] for odd k
 
 	// To compute the sliding window digits, use the following Sage script:
@@ -244,12 +253,14 @@ func (v *Point) MultiScalarMult(scalars []*Scalar, points []*Point) *Point {
 	// between each point in the multiscalar equation.
 
 	// Build lookup tables for each point
-	tables := make([]projLookupTable, len(points))
+	tables := make([]projLookupTable, 0, 2) // avoid allocation for small sizes
+	tables = slices.Grow(tables, len(points))[:len(points)]
 	for i := range tables {
 		tables[i].FromP3(points[i])
 	}
 	// Compute signed radix-16 digits for each scalar
-	digits := make([][64]int8, len(scalars))
+	digits := make([][64]int8, 0, 2) // avoid allocation for small sizes
+	digits = slices.Grow(digits, len(scalars))[:len(scalars)]
 	for i := range digits {
 		digits[i] = scalars[i].signedRadix16()
 	}
@@ -259,6 +270,7 @@ func (v *Point) MultiScalarMult(scalars []*Scalar, points []*Point) *Point {
 	tmp1 := &projP1xP1{}
 	tmp2 := &projP2{}
 	// Lookup-and-add the appropriate multiple of each input point
+	v.Set(NewIdentityPoint())
 	for j := range tables {
 		tables[j].SelectInto(multiple, digits[j][63])
 		tmp1.Add(v, multiple) // tmp1 = v + x_(j,63)*Q in P1xP1 coords
@@ -339,5 +351,51 @@ func (v *Point) VarTimeMultiScalarMult(scalars []*Scalar, points []*Point) *Poin
 	}
 
 	v.fromP2(tmp2)
+	return v
+}
+
+// Select sets v to a if cond == 1 and to b if cond == 0.
+func (v *Point) Select(a, b *Point, cond int) *Point {
+	checkInitialized(a, b)
+	v.x.Select(&a.x, &b.x, cond)
+	v.y.Select(&a.y, &b.y, cond)
+	v.z.Select(&a.z, &b.z, cond)
+	v.t.Select(&a.t, &b.t, cond)
+	return v
+}
+
+// Double sets v = p + p, and returns v.
+func (v *Point) Double(p *Point) *Point {
+	checkInitialized(p)
+
+	pp := new(projP2).FromP3(p)
+	p1 := new(projP1xP1).Double(pp)
+	return v.fromP1xP1(p1)
+}
+
+func (v *Point) addCached(p *Point, qCached *projCached) *Point {
+	result := new(projP1xP1).Add(p, qCached)
+	return v.fromP1xP1(result)
+}
+
+// ScalarMultSlow sets v = x * q, and returns v. It doesn't precompute a large
+// table, so it is considerably slower, but requires less memory.
+//
+// The scalar multiplication is done in constant time.
+func (v *Point) ScalarMultSlow(x *Scalar, q *Point) *Point {
+	checkInitialized(q)
+
+	s := x.Bytes()
+	qCached := new(projCached).FromP3(q)
+	v.Set(NewIdentityPoint())
+	t := new(Point)
+
+	for i := 255; i >= 0; i-- {
+		v.Double(v)
+		t.addCached(v, qCached)
+		cond := (s[i/8] >> (i % 8)) & 1
+		v.Select(t, v, int(cond))
+	}
+
 	return v
 }

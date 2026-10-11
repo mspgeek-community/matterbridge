@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -24,6 +25,12 @@ const (
 	LegacyUserServer  = "c.us"
 	BroadcastServer   = "broadcast"
 	HiddenUserServer  = "lid"
+	MessengerServer   = "msgr"
+	InteropServer     = "interop"
+	NewsletterServer  = "newsletter"
+	HostedServer      = "hosted"
+	HostedLIDServer   = "hosted.lid"
+	BotServer         = "bot"
 )
 
 // Some JIDs that are contacted often.
@@ -33,12 +40,26 @@ var (
 	ServerJID           = NewJID("", DefaultUserServer)
 	BroadcastServerJID  = NewJID("", BroadcastServer)
 	StatusBroadcastJID  = NewJID("status", BroadcastServer)
-	PSAJID              = NewJID("0", LegacyUserServer)
+	LegacyPSAJID        = NewJID("0", LegacyUserServer)
+	PSAJID              = NewJID("0", DefaultUserServer)
 	OfficialBusinessJID = NewJID("16505361212", LegacyUserServer)
+	MetaAIJID           = NewJID("13135550002", DefaultUserServer)
+	NewMetaAIJID        = NewJID("867051314767696", BotServer)
+	MuseJID             = NewJID("1807055946647697", BotServer) // Also known as "hatch"
+)
+
+var (
+	WhatsAppDomain  = uint8(0)   // This is the main domain type that whatsapp uses
+	LIDDomain       = uint8(1)   // This is the domain for LID type JIDs
+	HostedDomain    = uint8(128) // This is the domain for Hosted type JIDs
+	HostedLIDDomain = uint8(129) // This is the domain for Hosted LID type JIDs
 )
 
 // MessageID is the internal ID of a WhatsApp message.
 type MessageID = string
+
+// MessageServerID is the server ID of a WhatsApp newsletter message.
+type MessageServerID = int
 
 // JID represents a WhatsApp user ID.
 //
@@ -46,11 +67,26 @@ type MessageID = string
 // AD JIDs are only used to refer to specific devices of users, so the server is always s.whatsapp.net (DefaultUserServer).
 // Regular JIDs can be used for entities on any servers (users, groups, broadcasts).
 type JID struct {
-	User   string
-	Agent  uint8
-	Device uint8
-	Server string
-	AD     bool
+	User       string
+	RawAgent   uint8
+	Device     uint16
+	Integrator uint16
+	Server     string
+}
+
+func (jid JID) ActualAgent() uint8 {
+	switch jid.Server {
+	case DefaultUserServer:
+		return WhatsAppDomain
+	case HiddenUserServer:
+		return LIDDomain
+	case HostedServer:
+		return HostedDomain
+	case HostedLIDServer:
+		return HostedLIDDomain
+	default:
+		return jid.RawAgent
+	}
 }
 
 // UserInt returns the user as an integer. This is only safe to run on normal users, not on groups or broadcast lists.
@@ -61,23 +97,25 @@ func (jid JID) UserInt() uint64 {
 
 // ToNonAD returns a version of the JID struct that doesn't have the agent and device set.
 func (jid JID) ToNonAD() JID {
-	if jid.AD {
-		return JID{
-			User:   jid.User,
-			Server: DefaultUserServer,
-		}
-	} else {
-		return jid
+	return JID{
+		User:       jid.User,
+		Server:     jid.Server,
+		Integrator: jid.Integrator,
 	}
 }
 
 // SignalAddress returns the Signal protocol address for the user.
 func (jid JID) SignalAddress() *signalProtocol.SignalAddress {
+	return signalProtocol.NewSignalAddress(jid.SignalAddressUser(), uint32(jid.Device))
+}
+
+func (jid JID) SignalAddressUser() string {
 	user := jid.User
-	if jid.Agent != 0 {
-		user = fmt.Sprintf("%s_%d", jid.User, jid.Agent)
+	agent := jid.ActualAgent()
+	if agent != 0 {
+		user = fmt.Sprintf("%s_%d", jid.User, agent)
 	}
-	return signalProtocol.NewSignalAddress(user, uint32(jid.Device))
+	return user
 }
 
 // IsBroadcastList returns true if the JID is a broadcast list, but not the status broadcast.
@@ -85,44 +123,37 @@ func (jid JID) IsBroadcastList() bool {
 	return jid.Server == BroadcastServer && jid.User != StatusBroadcastJID.User
 }
 
-// NewADJID creates a new AD JID.
-func NewADJID(user string, agent, device uint8) JID {
-	return JID{
-		User:   user,
-		Agent:  agent,
-		Device: device,
-		Server: DefaultUserServer,
-		AD:     true,
-	}
+var botUserRegex = regexp.MustCompile(`^1313555\d{4}$|^131655500\d{2}$`)
+
+func (jid JID) IsBot() bool {
+	return (jid.Server == DefaultUserServer && botUserRegex.MatchString(jid.User) && jid.Device == 0) || jid.Server == BotServer
 }
 
-func parseADJID(user string) (JID, error) {
-	var fullJID JID
-	fullJID.AD = true
-	fullJID.Server = DefaultUserServer
-
-	dotIndex := strings.IndexRune(user, '.')
-	colonIndex := strings.IndexRune(user, ':')
-	if dotIndex < 0 || colonIndex < 0 || colonIndex+1 <= dotIndex {
-		return fullJID, fmt.Errorf("failed to parse ADJID: missing separators")
+// NewADJID creates a new AD JID.
+func NewADJID(user string, agent, device uint8) JID {
+	var server string
+	// agent terminology isn't 100% correct here, these are the domainType, but whatsapp usually places them in the same place (if the switch case below doesn't process it, then it is an agent instead)
+	switch agent {
+	case LIDDomain:
+		server = HiddenUserServer
+		agent = 0
+	case HostedDomain:
+		server = HostedServer
+		agent = 0
+	case HostedLIDDomain:
+		server = HostedLIDServer
+		agent = 0
+	case WhatsAppDomain:
+		fallthrough
+	default:
+		server = DefaultUserServer
 	}
-
-	fullJID.User = user[:dotIndex]
-	agent, err := strconv.Atoi(user[dotIndex+1 : colonIndex])
-	if err != nil {
-		return fullJID, fmt.Errorf("failed to parse agent from JID: %w", err)
-	} else if agent < 0 || agent > 255 {
-		return fullJID, fmt.Errorf("failed to parse agent from JID: invalid value (%d)", agent)
+	return JID{
+		User:     user,
+		RawAgent: agent,
+		Device:   uint16(device),
+		Server:   server,
 	}
-	device, err := strconv.Atoi(user[colonIndex+1:])
-	if err != nil {
-		return fullJID, fmt.Errorf("failed to parse device from JID: %w", err)
-	} else if device < 0 || device > 255 {
-		return fullJID, fmt.Errorf("failed to parse device from JID: invalid value (%d)", device)
-	}
-	fullJID.Agent = uint8(agent)
-	fullJID.Device = uint8(device)
-	return fullJID, nil
 }
 
 // ParseJID parses a JID out of the given string. It supports both regular and AD JIDs.
@@ -130,10 +161,44 @@ func ParseJID(jid string) (JID, error) {
 	parts := strings.Split(jid, "@")
 	if len(parts) == 1 {
 		return NewJID("", parts[0]), nil
-	} else if strings.ContainsRune(parts[0], ':') && strings.ContainsRune(parts[0], '.') && parts[1] == DefaultUserServer {
-		return parseADJID(parts[0])
 	}
-	return NewJID(parts[0], parts[1]), nil
+	parsedJID := JID{User: parts[0], Server: parts[1]}
+	if strings.ContainsRune(parsedJID.User, '.') {
+		parts = strings.Split(parsedJID.User, ".")
+		if len(parts) != 2 {
+			return parsedJID, fmt.Errorf("unexpected number of dots in JID")
+		}
+		parsedJID.User = parts[0]
+		ad := parts[1]
+		parts = strings.Split(ad, ":")
+		if len(parts) > 2 {
+			return parsedJID, fmt.Errorf("unexpected number of colons in JID")
+		}
+		agent, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return parsedJID, fmt.Errorf("failed to parse device from JID: %w", err)
+		}
+		parsedJID.RawAgent = uint8(agent)
+		if len(parts) == 2 {
+			device, err := strconv.Atoi(parts[1])
+			if err != nil {
+				return parsedJID, fmt.Errorf("failed to parse device from JID: %w", err)
+			}
+			parsedJID.Device = uint16(device)
+		}
+	} else if strings.ContainsRune(parsedJID.User, ':') {
+		parts = strings.Split(parsedJID.User, ":")
+		if len(parts) != 2 {
+			return parsedJID, fmt.Errorf("unexpected number of colons in JID")
+		}
+		parsedJID.User = parts[0]
+		device, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return parsedJID, fmt.Errorf("failed to parse device from JID: %w", err)
+		}
+		parsedJID.Device = uint16(device)
+	}
+	return parsedJID, nil
 }
 
 // NewJID creates a new regular JID.
@@ -144,11 +209,19 @@ func NewJID(user, server string) JID {
 	}
 }
 
+func (jid JID) ADString() string {
+	return fmt.Sprintf("%s.%d:%d@%s", jid.User, jid.RawAgent, jid.Device, jid.Server)
+}
+
 // String converts the JID to a string representation.
-// The output string can be parsed with ParseJID, except for JIDs with no User part specified.
+// The output string can be parsed with ParseJID.
 func (jid JID) String() string {
-	if jid.AD {
-		return fmt.Sprintf("%s.%d:%d@%s", jid.User, jid.Agent, jid.Device, jid.Server)
+	if jid.Server == "" {
+		return ""
+	} else if jid.RawAgent > 0 {
+		return fmt.Sprintf("%s.%d:%d@%s", jid.User, jid.RawAgent, jid.Device, jid.Server)
+	} else if jid.Device > 0 {
+		return fmt.Sprintf("%s:%d@%s", jid.User, jid.Device, jid.Server)
 	} else if len(jid.User) > 0 {
 		return fmt.Sprintf("%s@%s", jid.User, jid.Server)
 	} else {
@@ -176,10 +249,14 @@ func (jid JID) IsEmpty() bool {
 	return len(jid.Server) == 0
 }
 
+func (jid JID) IsZero() bool {
+	return jid.IsEmpty()
+}
+
 var _ sql.Scanner = (*JID)(nil)
 
 // Scan scans the given SQL value into this JID.
-func (jid *JID) Scan(src interface{}) error {
+func (jid *JID) Scan(src any) error {
 	if src == nil {
 		return nil
 	}

@@ -90,7 +90,7 @@ func (w *binaryEncoder) writeNode(n Node) {
 		hasContent = 1
 	}
 
-	w.writeListStart(2*len(n.Attrs) + tagSize + hasContent)
+	w.writeListStart(2*w.countAttributes(n.Attrs) + tagSize + hasContent)
 	w.writeString(n.Tag)
 	w.writeAttributes(n.Attrs)
 	if n.Content != nil {
@@ -98,7 +98,7 @@ func (w *binaryEncoder) writeNode(n Node) {
 	}
 }
 
-func (w *binaryEncoder) write(data interface{}) {
+func (w *binaryEncoder) write(data any) {
 	switch typedData := data.(type) {
 	case nil:
 		w.pushByte(token.ListEmpty)
@@ -159,11 +159,23 @@ func (w *binaryEncoder) writeStringRaw(value string) {
 }
 
 func (w *binaryEncoder) writeJID(jid types.JID) {
-	if jid.AD {
+	if ((jid.Server == types.DefaultUserServer || jid.Server == types.HiddenUserServer) && jid.Device > 0) ||
+		jid.Server == types.HostedServer || jid.Server == types.HostedLIDServer {
 		w.pushByte(token.ADJID)
-		w.pushByte(jid.Agent)
-		w.pushByte(jid.Device)
+		w.pushByte(jid.ActualAgent())
+		w.pushByte(uint8(jid.Device))
 		w.writeString(jid.User)
+	} else if jid.Server == types.MessengerServer {
+		w.pushByte(token.FBJID)
+		w.write(jid.User)
+		w.pushInt16(int(jid.Device))
+		w.write(jid.Server)
+	} else if jid.Server == types.InteropServer {
+		w.pushByte(token.InteropJID)
+		w.write(jid.User)
+		w.pushInt16(int(jid.Device))
+		w.pushInt16(int(jid.Integrator))
+		w.write(jid.Server)
 	} else {
 		w.pushByte(token.JIDPair)
 		if len(jid.User) == 0 {
@@ -176,10 +188,6 @@ func (w *binaryEncoder) writeJID(jid types.JID) {
 }
 
 func (w *binaryEncoder) writeAttributes(attributes Attrs) {
-	if attributes == nil {
-		return
-	}
-
 	for key, val := range attributes {
 		if val == "" || val == nil {
 			continue
@@ -188,6 +196,16 @@ func (w *binaryEncoder) writeAttributes(attributes Attrs) {
 		w.writeString(key)
 		w.write(val)
 	}
+}
+
+func (w *binaryEncoder) countAttributes(attributes Attrs) (count int) {
+	for _, val := range attributes {
+		if val == "" || val == nil {
+			continue
+		}
+		count += 1
+	}
+	return
 }
 
 func (w *binaryEncoder) writeListStart(listSize int) {
@@ -269,7 +287,7 @@ func validateHex(value string) bool {
 		return false
 	}
 	for _, char := range value {
-		if !(char >= '0' && char <= '9') && !(char >= 'A' && char <= 'F') && !(char >= 'a' && char <= 'f') {
+		if !(char >= '0' && char <= '9') && !(char >= 'A' && char <= 'F') {
 			return false
 		}
 	}
@@ -282,8 +300,6 @@ func packHex(value byte) byte {
 		return value - '0'
 	case value >= 'A' && value <= 'F':
 		return 10 + value - 'A'
-	case value >= 'a' && value <= 'f':
-		return 10 + value - 'a'
 	case value == 0:
 		return 15
 	default:

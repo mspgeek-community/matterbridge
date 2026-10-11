@@ -7,39 +7,48 @@
 package whatsmeow
 
 import (
+	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
+
+	"github.com/rs/zerolog"
+	"go.mau.fi/util/ptr"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
-func (cli *Client) handleReceipt(node *waBinary.Node) {
-	receipt, err := cli.parseReceipt(node)
+func (cli *Client) handleReceipt(ctx context.Context, node *waBinary.Node) {
+	var cancelled bool
+	receipt, participants, err := cli.parseReceipt(node)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse receipt: %v", err)
-	} else if receipt != nil {
-		if receipt.Type == events.ReceiptTypeRetry {
-			go func() {
-				err := cli.handleRetryReceipt(receipt, node)
-				if err != nil {
-					cli.Log.Errorf("Failed to handle retry receipt for %s/%s from %s: %v", receipt.Chat, receipt.MessageIDs[0], receipt.Sender, err)
-				}
-			}()
+		go cli.sendAck(ctx, node, NackParsingError)
+	} else if participants != nil {
+		defer cli.maybeDeferredAck(ctx, node)(&cancelled)
+		for _, pcp := range participants {
+			cancelled = cli.handleGroupedReceipt(*receipt, &pcp)
 		}
-		go cli.dispatchEvent(receipt)
+	} else {
+		if receipt.Type == types.ReceiptTypeRetry {
+			// Ack happens inside the retry receipt handler
+			cli.backgroundIfAsyncAck(func() {
+				cli.tryHandleRetryReceipt(ctx, receipt, node)
+			})
+		} else {
+			defer cli.maybeDeferredAck(ctx, node)(&cancelled)
+		}
+		cancelled = cli.dispatchEvent(receipt)
 	}
-	go cli.sendAck(node)
 }
 
-func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node) {
+func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node) (cancelled bool) {
 	pag := participants.AttrGetter()
 	partialReceipt.MessageIDs = []types.MessageID{pag.String("key")}
 	for _, child := range participants.GetChildren() {
 		if child.Tag != "user" {
-			cli.Log.Warnf("Unexpected node in grouped receipt participants: %s", child.XMLString())
+			cli.Log.Warnf("Unexpected node in grouped receipt participants: %s", &child)
 			continue
 		}
 		ag := child.AttrGetter()
@@ -47,37 +56,36 @@ func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participa
 		receipt.Timestamp = ag.UnixTime("t")
 		receipt.MessageSource.Sender = ag.JID("jid")
 		if !ag.OK() {
-			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", child.XMLString(), ag.Error())
+			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", &child, ag.Error())
 			continue
 		}
-		go cli.dispatchEvent(&receipt)
+		cancelled = cli.dispatchEvent(&receipt) || cancelled
 	}
+	return
 }
 
-func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
+func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, []waBinary.Node, error) {
 	ag := node.AttrGetter()
 	source, err := cli.parseMessageSource(node, false)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	receipt := events.Receipt{
 		MessageSource: source,
 		Timestamp:     ag.UnixTime("t"),
-		Type:          events.ReceiptType(ag.OptionalString("type")),
+		Type:          types.ReceiptType(ag.OptionalString("type")),
+		MessageSender: ag.OptionalJIDOrEmpty("recipient"),
 	}
 	if source.IsGroup && source.Sender.IsEmpty() {
 		participantTags := node.GetChildrenByTag("participants")
 		if len(participantTags) == 0 {
-			return nil, &ElementMissingError{Tag: "participants", In: "grouped receipt"}
+			return nil, nil, &ElementMissingError{Tag: "participants", In: "grouped receipt"}
 		}
-		for _, pcp := range participantTags {
-			cli.handleGroupedReceipt(receipt, &pcp)
-		}
-		return nil, nil
+		return &receipt, participantTags, nil
 	}
 	mainMessageID := ag.String("id")
 	if !ag.OK() {
-		return nil, fmt.Errorf("failed to parse read receipt attrs: %+v", ag.Errors)
+		return nil, nil, fmt.Errorf("failed to parse read receipt attrs: %+v", ag.Errors)
 	}
 
 	receiptChildren := node.GetChildren()
@@ -93,10 +101,54 @@ func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
 	} else {
 		receipt.MessageIDs = []types.MessageID{mainMessageID}
 	}
-	return &receipt, nil
+	return &receipt, nil, nil
 }
 
-func (cli *Client) sendAck(node *waBinary.Node) {
+func (cli *Client) backgroundIfAsyncAck(fn func()) {
+	if cli.SynchronousAck {
+		fn()
+	} else {
+		go fn()
+	}
+}
+
+func (cli *Client) maybeDeferredAck(ctx context.Context, node *waBinary.Node) func(cancelled ...*bool) {
+	if cli.SynchronousAck {
+		return func(cancelled ...*bool) {
+			isCancelled := len(cancelled) > 0 && ptr.Val(cancelled[0])
+			if ctx.Err() != nil || isCancelled {
+				zerolog.Ctx(ctx).Debug().
+					AnErr("ctx_err", ctx.Err()).
+					Bool("cancelled", isCancelled).
+					Str("node_tag", node.Tag).
+					Msg("Not sending ack for node")
+				return
+			}
+			cli.sendAck(ctx, node, 0)
+		}
+	} else {
+		go cli.sendAck(ctx, node, 0)
+		return func(...*bool) {}
+	}
+}
+
+const (
+	NackParsingError                 = 487
+	NackUnrecognizedStanza           = 488
+	NackUnrecognizedStanzaClass      = 489
+	NackUnrecognizedStanzaType       = 490
+	NackInvalidProtobuf              = 491
+	NackInvalidHostedCompanionStanza = 493
+	NackMissingMessageSecret         = 495
+	NackSignalErrorOldCounter        = 496
+	NackMessageDeletedOnPeer         = 499
+	NackUnhandledError               = 500
+	NackUnsupportedAdminRevoke       = 550
+	NackUnsupportedLIDGroup          = 551
+	NackDBOperationFailed            = 552
+)
+
+func (cli *Client) sendAck(ctx context.Context, node *waBinary.Node, error int) {
 	attrs := waBinary.Attrs{
 		"class": node.Tag,
 		"id":    node.Attrs["id"],
@@ -107,11 +159,23 @@ func (cli *Client) sendAck(node *waBinary.Node) {
 	}
 	if recipient, ok := node.Attrs["recipient"]; ok {
 		attrs["recipient"] = recipient
+
+		// TODO this hack probably needs to be removed at some point
+		recipientJID, ok := recipient.(types.JID)
+		if ok && recipientJID.Server == types.BotServer && node.Tag == "message" {
+			altRecipient, ok := types.BotJIDMap[recipientJID]
+			if ok {
+				attrs["recipient"] = altRecipient
+			}
+		}
 	}
 	if receiptType, ok := node.Attrs["type"]; node.Tag != "message" && ok {
 		attrs["type"] = receiptType
 	}
-	err := cli.sendNode(waBinary.Node{
+	if error != 0 {
+		attrs["error"] = error
+	}
+	err := cli.sendNode(ctx, waBinary.Node{
 		Tag:   "ack",
 		Attrs: attrs,
 	})
@@ -127,20 +191,36 @@ func (cli *Client) sendAck(node *waBinary.Node) {
 //
 // You can mark multiple messages as read at the same time, but only if the messages were sent by the same user.
 // To mark messages by different users as read, you must call MarkRead multiple times (once for each user).
-func (cli *Client) MarkRead(ids []types.MessageID, timestamp time.Time, chat, sender types.JID) error {
+//
+// To mark a voice message as played, specify types.ReceiptTypePlayed as the last parameter.
+// Providing more than one receipt type will panic: the parameter is only a vararg for backwards compatibility.
+func (cli *Client) MarkRead(ctx context.Context, ids []types.MessageID, timestamp time.Time, chat, sender types.JID, receiptTypeExtra ...types.ReceiptType) error {
+	if len(ids) == 0 {
+		return fmt.Errorf("no message IDs specified")
+	}
+	receiptType := types.ReceiptTypeRead
+	if len(receiptTypeExtra) == 1 {
+		receiptType = receiptTypeExtra[0]
+	} else if len(receiptTypeExtra) > 1 {
+		panic(fmt.Errorf("too many receipt types specified"))
+	}
 	node := waBinary.Node{
 		Tag: "receipt",
 		Attrs: waBinary.Attrs{
 			"id":   ids[0],
-			"type": "read",
+			"type": string(receiptType),
 			"to":   chat,
 			"t":    timestamp.Unix(),
 		},
 	}
-	if cli.GetPrivacySettings().ReadReceipts == types.PrivacySettingNone {
-		node.Attrs["type"] = "read-self"
+	if chat.Server == types.NewsletterServer || cli.GetPrivacySettings(ctx).ReadReceipts == types.PrivacySettingNone {
+		switch receiptType {
+		case types.ReceiptTypeRead:
+			node.Attrs["type"] = string(types.ReceiptTypeReadSelf)
+			// TODO change played to played-self?
+		}
 	}
-	if !sender.IsEmpty() && chat.Server != types.DefaultUserServer {
+	if !sender.IsEmpty() && chat.Server != types.DefaultUserServer && chat.Server != types.HiddenUserServer && chat.Server != types.MessengerServer {
 		node.Attrs["participant"] = sender.ToNonAD()
 	}
 	if len(ids) > 1 {
@@ -154,7 +234,7 @@ func (cli *Client) MarkRead(ids []types.MessageID, timestamp time.Time, chat, se
 			Content: children,
 		}}
 	}
-	return cli.sendNode(node)
+	return cli.sendNode(ctx, node)
 }
 
 // SetForceActiveDeliveryReceipts will force the client to send normal delivery
@@ -173,32 +253,41 @@ func (cli *Client) MarkRead(ids []types.MessageID, timestamp time.Time, chat, se
 // Note that if you turn this off (i.e. call SetForceActiveDeliveryReceipts(false)),
 // receipts will act like the client is offline until SendPresence is called again.
 func (cli *Client) SetForceActiveDeliveryReceipts(active bool) {
+	if cli == nil {
+		return
+	}
 	if active {
-		atomic.StoreUint32(&cli.sendActiveReceipts, 2)
+		cli.sendActiveReceipts.Store(2)
 	} else {
-		atomic.StoreUint32(&cli.sendActiveReceipts, 0)
+		cli.sendActiveReceipts.Store(0)
 	}
 }
 
-func (cli *Client) sendMessageReceipt(info *types.MessageInfo) {
+func buildBaseReceipt(id string, node *waBinary.Node) waBinary.Attrs {
 	attrs := waBinary.Attrs{
-		"id": info.ID,
+		"id": id,
+		"to": node.Attrs["from"],
 	}
+	if recipient, ok := node.Attrs["recipient"]; ok {
+		attrs["recipient"] = recipient
+	}
+	if participant, ok := node.Attrs["participant"]; ok {
+		attrs["participant"] = participant
+	}
+	return attrs
+}
+
+func (cli *Client) sendMessageReceipt(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) {
+	attrs := buildBaseReceipt(info.ID, node)
 	if info.IsFromMe {
-		attrs["type"] = "sender"
-	} else if atomic.LoadUint32(&cli.sendActiveReceipts) == 0 {
-		attrs["type"] = "inactive"
+		attrs["type"] = string(types.ReceiptTypeSender)
+		if info.Type == "peer_msg" {
+			attrs["type"] = string(types.ReceiptTypePeerMsg)
+		}
+	} else if cli.sendActiveReceipts.Load() == 0 {
+		attrs["type"] = string(types.ReceiptTypeInactive)
 	}
-	attrs["to"] = info.Chat
-	if info.IsGroup {
-		attrs["participant"] = info.Sender
-	} else if info.IsFromMe {
-		attrs["recipient"] = info.Sender
-	} else {
-		// Override the to attribute with the JID version with a device number
-		attrs["to"] = info.Sender
-	}
-	err := cli.sendNode(waBinary.Node{
+	err := cli.sendNode(ctx, waBinary.Node{
 		Tag:   "receipt",
 		Attrs: attrs,
 	})

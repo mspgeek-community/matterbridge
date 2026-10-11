@@ -7,6 +7,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
@@ -14,58 +15,36 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
+	"go.mau.fi/util/random"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/pbkdf2"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
-	waProto "go.mau.fi/whatsmeow/binary/proto"
-	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/util/hkdfutil"
 	"go.mau.fi/whatsmeow/util/keys"
-	"go.mau.fi/whatsmeow/util/randbytes"
 )
 
 // PairClientType is the type of client to use with PairCode.
 // The type is automatically filled based on store.DeviceProps.PlatformType (which is what QR login uses).
-type PairClientType int
+type PairClientType string
 
 const (
-	PairClientUnknown PairClientType = iota
-	PairClientChrome
-	PairClientEdge
-	PairClientFirefox
-	PairClientIE
-	PairClientOpera
-	PairClientSafari
-	PairClientElectron
-	PairClientUWP
-	PairClientOtherWebClient
+	PairClientUnknown        PairClientType = "0"
+	PairClientChrome         PairClientType = "1"
+	PairClientEdge           PairClientType = "2"
+	PairClientFirefox        PairClientType = "3"
+	PairClientIE             PairClientType = "4"
+	PairClientOpera          PairClientType = "5"
+	PairClientSafari         PairClientType = "6"
+	PairClientElectron       PairClientType = "7"
+	PairClientUWP            PairClientType = "8"
+	PairClientOtherWebClient PairClientType = "9"
+	PairClientMacOS          PairClientType = "c"
+	PairClientAndroid        PairClientType = "e"
 )
-
-func platformTypeToPairClientType(platformType waProto.DeviceProps_PlatformType) PairClientType {
-	switch platformType {
-	case waProto.DeviceProps_CHROME:
-		return PairClientChrome
-	case waProto.DeviceProps_EDGE:
-		return PairClientEdge
-	case waProto.DeviceProps_FIREFOX:
-		return PairClientFirefox
-	case waProto.DeviceProps_IE:
-		return PairClientIE
-	case waProto.DeviceProps_OPERA:
-		return PairClientOpera
-	case waProto.DeviceProps_SAFARI:
-		return PairClientSafari
-	case waProto.DeviceProps_DESKTOP:
-		return PairClientElectron
-	case waProto.DeviceProps_UWP:
-		return PairClientUWP
-	default:
-		return PairClientOtherWebClient
-	}
-}
 
 var notNumbers = regexp.MustCompile("[^0-9]")
 var linkingBase32 = base32.NewEncoding("123456789ABCDEFGHJKLMNPQRSTVWXYZ")
@@ -79,9 +58,9 @@ type phoneLinkingCache struct {
 
 func generateCompanionEphemeralKey() (ephemeralKeyPair *keys.KeyPair, ephemeralKey []byte, encodedLinkingCode string) {
 	ephemeralKeyPair = keys.NewKeyPair()
-	salt := randbytes.Make(32)
-	iv := randbytes.Make(16)
-	linkingCode := randbytes.Make(5)
+	salt := random.Bytes(32)
+	iv := random.Bytes(16)
+	linkingCode := random.Bytes(5)
 	encodedLinkingCode = linkingBase32.EncodeToString(linkingCode)
 	linkCodeKey := pbkdf2.Key([]byte(encodedLinkingCode), salt, 2<<16, 32, sha256.New)
 	linkCipherBlock, _ := aes.NewCipher(linkCodeKey)
@@ -96,19 +75,33 @@ func generateCompanionEphemeralKey() (ephemeralKeyPair *keys.KeyPair, ephemeralK
 
 // PairPhone generates a pairing code that can be used to link to a phone without scanning a QR code.
 //
+// You must connect the client normally before calling this (which means you'll also receive a QR code
+// event, but that can be ignored when doing code pairing). You should also wait for `*events.QR` before
+// calling this to ensure the connection is fully established. If using [Client.GetQRChannel], wait for
+// the first item in the channel. Alternatively, sleeping for a second after calling Connect will probably work too.
+//
 // The exact expiry of pairing codes is unknown, but QR codes are always generated and the login websocket is closed
 // after the QR codes run out, which means there's a 160-second time limit. It is recommended to generate the pairing
 // code immediately after connecting to the websocket to have the maximum time.
 //
+// The clientType parameter must be one of the PairClient* constants, but which one doesn't matter.
+// The client display name must be formatted as `Browser (OS)`, and only common browsers/OSes are allowed
+// (the server will validate it and return 400 if it's wrong).
+//
 // See https://faq.whatsapp.com/1324084875126592 for more info
-func (cli *Client) PairPhone(phone string, showPushNotification bool) (string, error) {
-	clientType := platformTypeToPairClientType(store.DeviceProps.GetPlatformType())
-	clientDisplayName := store.DeviceProps.GetOs()
-
+func (cli *Client) PairPhone(ctx context.Context, phone string, showPushNotification bool, clientType PairClientType, clientDisplayName string) (string, error) {
+	if cli == nil {
+		return "", ErrClientIsNil
+	}
 	ephemeralKeyPair, ephemeralKey, encodedLinkingCode := generateCompanionEphemeralKey()
 	phone = notNumbers.ReplaceAllString(phone, "")
+	if len(phone) <= 6 {
+		return "", ErrPhoneNumberTooShort
+	} else if strings.HasPrefix(phone, "0") {
+		return "", ErrPhoneNumberIsNotInternational
+	}
 	jid := types.NewJID(phone, types.DefaultUserServer)
-	resp, err := cli.sendIQ(infoQuery{
+	resp, err := cli.sendIQ(ctx, infoQuery{
 		Namespace: "md",
 		Type:      iqSet,
 		To:        types.ServerJID,
@@ -123,7 +116,7 @@ func (cli *Client) PairPhone(phone string, showPushNotification bool) (string, e
 			Content: []waBinary.Node{
 				{Tag: "link_code_pairing_wrapped_companion_ephemeral_pub", Content: ephemeralKey},
 				{Tag: "companion_server_auth_key_pub", Content: cli.Store.NoiseKey.Pub[:]},
-				{Tag: "companion_platform_id", Content: strconv.Itoa(int(clientType))},
+				{Tag: "companion_platform_id", Content: string(clientType)},
 				{Tag: "companion_platform_display", Content: clientDisplayName},
 				{Tag: "link_code_pairing_nonce", Content: []byte{0}},
 			},
@@ -140,23 +133,23 @@ func (cli *Client) PairPhone(phone string, showPushNotification bool) (string, e
 	if !ok {
 		return "", fmt.Errorf("unexpected type %T in content of link_code_pairing_ref tag", pairingRefNode.Content)
 	}
-	cli.phoneLinkingCache = &phoneLinkingCache{
+	cli.phoneLinkingCache.Store(&phoneLinkingCache{
 		jid:         jid,
 		keyPair:     ephemeralKeyPair,
 		linkingCode: encodedLinkingCode,
 		pairingRef:  string(pairingRef),
-	}
+	})
 	return encodedLinkingCode[0:4] + "-" + encodedLinkingCode[4:], nil
 }
 
-func (cli *Client) tryHandleCodePairNotification(parentNode *waBinary.Node) {
-	err := cli.handleCodePairNotification(parentNode)
+func (cli *Client) tryHandleCodePairNotification(ctx context.Context, parentNode *waBinary.Node) {
+	err := cli.handleCodePairNotification(ctx, parentNode)
 	if err != nil {
 		cli.Log.Errorf("Failed to handle code pair notification: %s", err)
 	}
 }
 
-func (cli *Client) handleCodePairNotification(parentNode *waBinary.Node) error {
+func (cli *Client) handleCodePairNotification(ctx context.Context, parentNode *waBinary.Node) error {
 	node, ok := parentNode.GetOptionalChildByTag("link_code_companion_reg")
 	if !ok {
 		return &ElementMissingError{
@@ -164,10 +157,11 @@ func (cli *Client) handleCodePairNotification(parentNode *waBinary.Node) error {
 			In:  "notification",
 		}
 	}
-	linkCache := cli.phoneLinkingCache
+	linkCache := cli.phoneLinkingCache.Load()
 	if linkCache == nil {
 		return fmt.Errorf("received code pair notification without a pending pairing")
 	}
+	cli.paired.Store(false)
 	linkCodePairingRef, _ := node.GetChildByTag("link_code_pairing_ref").Content.([]byte)
 	if string(linkCodePairingRef) != linkCache.pairingRef {
 		return fmt.Errorf("pairing ref mismatch in code pair notification")
@@ -178,6 +172,8 @@ func (cli *Client) handleCodePairNotification(parentNode *waBinary.Node) error {
 			Tag: "link_code_pairing_wrapped_primary_ephemeral_pub",
 			In:  "notification",
 		}
+	} else if len(wrappedPrimaryEphemeralPub) < 80 {
+		return fmt.Errorf("unexpected length of link_code_pairing_wrapped_primary_ephemeral_pub: %d", len(wrappedPrimaryEphemeralPub))
 	}
 	primaryIdentityPub, ok := node.GetChildByTag("primary_identity_pub").Content.([]byte)
 	if !ok {
@@ -187,9 +183,9 @@ func (cli *Client) handleCodePairNotification(parentNode *waBinary.Node) error {
 		}
 	}
 
-	advSecretRandom := randbytes.Make(32)
-	keyBundleSalt := randbytes.Make(32)
-	keyBundleNonce := randbytes.Make(12)
+	advSecretRandom := random.Bytes(32)
+	keyBundleSalt := random.Bytes(32)
+	keyBundleNonce := random.Bytes(12)
 
 	// Decrypt the primary device's ephemeral public key, which was encrypted with the 8-character pairing code,
 	// then compute the DH shared secret using our ephemeral private key we generated earlier.
@@ -231,7 +227,7 @@ func (cli *Client) handleCodePairNotification(parentNode *waBinary.Node) error {
 	advSecret := hkdfutil.SHA256(advSecretInput, nil, []byte("adv_secret"), 32)
 	cli.Store.AdvSecretKey = advSecret
 
-	_, err = cli.sendIQ(infoQuery{
+	_, err = cli.sendIQ(ctx, infoQuery{
 		Namespace: "md",
 		Type:      iqSet,
 		To:        types.ServerJID,

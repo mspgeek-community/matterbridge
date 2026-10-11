@@ -1,5 +1,7 @@
 package ddp
 
+import "sync"
+
 // ----------------------------------------------------------------------
 // Collection
 // ----------------------------------------------------------------------
@@ -40,7 +42,7 @@ func NewMockCollection() Collection {
 
 // NewCollection creates a new collection - always KeyCache.
 func NewCollection(name string) Collection {
-	return &KeyCache{name, make(map[string]Update), nil}
+	return &KeyCache{Name: name, items: make(map[string]Update)}
 }
 
 // KeyCache caches items keyed on unique ID.
@@ -51,7 +53,8 @@ type KeyCache struct {
 	items map[string]Update
 	// listeners contains all the listeners that should be notified of collection updates.
 	listeners []UpdateListener
-	// TODO(badslug): do we need to protect from multiple threads
+	// mux protects from multiple threads
+	mux sync.RWMutex
 }
 
 func (c *KeyCache) added(msg Update) {
@@ -95,20 +98,23 @@ func (c *KeyCache) movedBefore(msg Update) {
 // init prepares the collection for data updates (called when a new connection is
 // made or a connection/session is resumed).
 func (c *KeyCache) init() {
-	// TODO start to patch up the current data with fresh server state
+	// Reset the local collection with fresh server state
+	c.items = make(map[string]Update)
 }
 
+// reset causes the collection to return to a fresh state. Resets are currently implemented by clearing all items
+// from the collection cache.
 func (c *KeyCache) reset() {
-	// TODO we should mark the collection but maintain it's contents and then
-	// patch up the current contents with the new contents when we receive them.
-	//c.items = nil
+	c.init()
 	c.notify("reset", "", nil)
 }
 
 // notify sends a Update to all UpdateListener's which should never block.
 func (c *KeyCache) notify(operation, id string, doc Update) {
+	c.mux.RLock()
+	defer c.mux.RUnlock()
 	for _, listener := range c.listeners {
-		listener.CollectionUpdate(c.Name, operation, id, doc)
+		go listener.CollectionUpdate(c.Name, operation, id, doc)
 	}
 }
 
@@ -124,6 +130,8 @@ func (c *KeyCache) FindAll() map[string]Update {
 
 // AddUpdateListener adds a listener for changes on a collection.
 func (c *KeyCache) AddUpdateListener(listener UpdateListener) {
+	c.mux.Lock()
+	defer c.mux.Unlock()
 	c.listeners = append(c.listeners, listener)
 }
 

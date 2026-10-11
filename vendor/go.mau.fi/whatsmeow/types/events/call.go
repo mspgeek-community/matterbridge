@@ -27,6 +27,20 @@ type CallAccept struct {
 	Data *waBinary.Node
 }
 
+type CallPreAccept struct {
+	types.BasicCallMeta
+	types.CallRemoteMeta
+
+	Data *waBinary.Node
+}
+
+type CallTransport struct {
+	types.BasicCallMeta
+	types.CallRemoteMeta
+
+	Data *waBinary.Node
+}
+
 // CallOfferNotice is emitted when the user receives a notice of a call on WhatsApp.
 // This seems to be primarily for group calls (whereas CallOffer is for 1:1 calls).
 type CallOfferNotice struct {
@@ -49,6 +63,12 @@ type CallTerminate struct {
 	types.BasicCallMeta
 	Reason string
 	Data   *waBinary.Node
+}
+
+// CallReject is sent when the other party rejects the call on WhatsApp.
+type CallReject struct {
+	types.BasicCallMeta
+	Data *waBinary.Node
 }
 
 // UnknownCallEvent is emitted when a call element with unknown content is received.

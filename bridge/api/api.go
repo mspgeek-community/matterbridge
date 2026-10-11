@@ -119,7 +119,7 @@ func (b *API) Send(msg config.Message) (string, error) {
 
 	data, err := json.Marshal(msg)
 	if err != nil {
-		b.Log.Errorf("failed to encode message  '%s'", msg)
+		b.Log.Errorf("failed to encode message %#v: %s", msg, err)
 	}
 	_ = b.mrouter.Broadcast(data)
 	return "", nil

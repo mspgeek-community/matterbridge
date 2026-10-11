@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mspgeek-community/matterbridge/bridge/config"
+	"github.com/mspgeek-community/matterbridge/bridge/helper"
 	"github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
 )
@@ -19,6 +20,7 @@ type users struct {
 	sc  *slack.Client
 
 	users           map[string]*slack.User
+	nameIndex       helper.NameIndex
 	usersMutex      sync.RWMutex
 	usersSyncPoints map[string]chan struct{}
 
@@ -32,6 +34,7 @@ func newUserManager(log *logrus.Entry, sc *slack.Client) *users {
 		log:             log,
 		sc:              sc,
 		users:           make(map[string]*slack.User),
+		nameIndex:       helper.NameIndex{},
 		usersSyncPoints: make(map[string]chan struct{}),
 		earliestRefresh: time.Now(),
 	}
@@ -86,11 +89,14 @@ func (b *users) populateUser(userID string) {
 			// We do not return and iterate again to check that the entry does indeed exist
 			// in case the previous query failed for some reason.
 		} else {
-			b.usersSyncPoints[userID] = make(chan struct{})
+			syncPoint := make(chan struct{})
+			b.usersSyncPoints[userID] = syncPoint
 			defer func() {
 				// Wake up any waiting goroutines and remove the synchronization point.
-				close(b.usersSyncPoints[userID])
+				b.usersMutex.Lock()
 				delete(b.usersSyncPoints, userID)
+				b.usersMutex.Unlock()
+				close(syncPoint)
 			}()
 			break
 		}
@@ -106,11 +112,24 @@ func (b *users) populateUser(userID string) {
 		return
 	}
 
-	b.usersMutex.Lock()
-	defer b.usersMutex.Unlock()
-
 	// Register user information.
+	b.usersMutex.Lock()
 	b.users[userID] = user
+	b.nameIndex.Add(user.ID, userNames(user)...)
+	b.usersMutex.Unlock()
+}
+
+// userNames returns the names a Slack user can be mentioned by.
+func userNames(user *slack.User) []string {
+	return []string{user.Profile.DisplayName, user.RealName, user.Profile.RealName, user.Name}
+}
+
+// lookupByName returns the ID of the user whose display name, real name or
+// username matches name (ignoring case, spaces and punctuation).
+func (b *users) lookupByName(name string) (string, bool) {
+	b.usersMutex.RLock()
+	defer b.usersMutex.RUnlock()
+	return b.nameIndex.Lookup(name)
 }
 
 func (b *users) invalidateUser(userID string) {
@@ -134,6 +153,9 @@ func (b *users) populateUsers(wait bool) {
 	}
 	b.refreshInProgress = true
 	b.refreshMutex.Unlock()
+	// Always clear the flag: an early return used to leave it set, after which
+	// populateUsers(true) waited forever and blocked the Slack event loop.
+	defer b.clearRefresh()
 
 	newUsers := map[string]*slack.User{}
 	pagination := b.sc.GetUsersPaginated(slack.GetUsersOptionLimit(200))
@@ -157,19 +179,23 @@ func (b *users) populateUsers(wait bool) {
 		for i := range pagination.Users {
 			newUsers[pagination.Users[i].ID] = &pagination.Users[i]
 		}
-		b.log.Debugf("getting %d users", len(pagination.Users))
 		count++
-		// more > 2000 users, slack will complain and ratelimit. break
-		if count > 10 {
-			b.log.Info("Large slack detected > 2000 users, skipping loading complete userlist.")
-			break
-		}
+		b.log.Infof("Loading Slack users: page %d, %d users so far", count, len(newUsers))
+	}
+	b.log.Infof("Loaded %d Slack users in %d pages", len(newUsers), count)
+
+	newIndex := helper.NameIndex{}
+	for id, user := range newUsers {
+		newIndex.Add(id, userNames(user)...)
 	}
 
 	b.usersMutex.Lock()
-	defer b.usersMutex.Unlock()
 	b.users = newUsers
+	b.nameIndex = newIndex
+	b.usersMutex.Unlock()
+}
 
+func (b *users) clearRefresh() {
 	b.refreshMutex.Lock()
 	defer b.refreshMutex.Unlock()
 	b.earliestRefresh = time.Now().Add(minimumRefreshInterval)
@@ -281,7 +307,10 @@ func (b *channels) populateChannels(wait bool) {
 	}
 	b.refreshInProgress = true
 	b.refreshMutex.Unlock()
+	// Always clear the flag, see users.populateUsers.
+	defer b.clearRefresh()
 
+	b.log.Info("Loading Slack channels")
 	newChannelsByID := map[string]*slack.Channel{}
 	newChannelsByName := map[string]*slack.Channel{}
 	newChannelMembers := make(map[string][]string)
@@ -327,6 +356,7 @@ func (b *channels) populateChannels(wait bool) {
 		queryParams.Cursor = nextCursor
 	}
 
+	b.log.Infof("Loaded %d Slack channels", len(newChannelsByID))
 	b.channelsMutex.Lock()
 	defer b.channelsMutex.Unlock()
 	b.channelsByID = newChannelsByID
@@ -335,7 +365,9 @@ func (b *channels) populateChannels(wait bool) {
 	b.channelMembersMutex.Lock()
 	defer b.channelMembersMutex.Unlock()
 	b.channelMembers = newChannelMembers
+}
 
+func (b *channels) clearRefresh() {
 	b.refreshMutex.Lock()
 	defer b.refreshMutex.Unlock()
 	b.earliestRefresh = time.Now().Add(minimumRefreshInterval)

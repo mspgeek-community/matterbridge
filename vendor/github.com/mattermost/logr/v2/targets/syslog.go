@@ -1,4 +1,4 @@
-// +build !windows,!nacl,!plan9
+//go:build !windows && !nacl && !plan9
 
 package targets
 
@@ -19,7 +19,7 @@ type Syslog struct {
 
 // SyslogOptions provides parameters for dialing a syslog daemon.
 type SyslogOptions struct {
-	IP       string `json:"ip,omitempty"` // deprecated
+	IP       string `json:"ip,omitempty"` // deprecated (use Host instead)
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	TLS      bool   `json:"tls"`
@@ -55,18 +55,24 @@ func (s *Syslog) Init() error {
 	network := "tcp"
 	var config *tls.Config
 
+	host := s.params.Host
+	if host == "" {
+		host = s.params.IP
+	}
+
 	if s.params.TLS {
 		network = "tcp+tls"
 		config = &tls.Config{InsecureSkipVerify: s.params.Insecure}
-		if s.params.Cert != "" {
-			pool, err := GetCertPool(s.params.Cert)
-			if err != nil {
-				return err
-			}
+
+		pool, err := GetCertPoolOrNil(s.params.Cert)
+		if err != nil {
+			return err
+		}
+		if pool != nil {
 			config.RootCAs = pool
 		}
 	}
-	raddr := fmt.Sprintf("%s:%d", s.params.IP, s.params.Port)
+	raddr := fmt.Sprintf("%s:%d", host, s.params.Port)
 	if raddr == ":0" {
 		// If no IP:port provided then connect to local syslog.
 		raddr = ""

@@ -17,7 +17,9 @@ import (
 
 	"go.mau.fi/libsignal/ecc"
 
-	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/proto/waWa6"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // WAVersionContainer is a container for a WhatsApp web version number.
@@ -65,8 +67,8 @@ func (vc WAVersionContainer) Hash() [16]byte {
 	return md5.Sum([]byte(vc.String()))
 }
 
-func (vc WAVersionContainer) ProtoAppVersion() *waProto.ClientPayload_UserAgent_AppVersion {
-	return &waProto.ClientPayload_UserAgent_AppVersion{
+func (vc WAVersionContainer) ProtoAppVersion() *waWa6.ClientPayload_UserAgent_AppVersion {
+	return &waWa6.ClientPayload_UserAgent_AppVersion{
 		Primary:   &vc[0],
 		Secondary: &vc[1],
 		Tertiary:  &vc[2],
@@ -74,14 +76,10 @@ func (vc WAVersionContainer) ProtoAppVersion() *waProto.ClientPayload_UserAgent_
 }
 
 // waVersion is the WhatsApp web client version
-var waVersion = WAVersionContainer{2, 2332, 15}
+var waVersion = WAVersionContainer{2, 3000, 1049558099}
 
 // waVersionHash is the md5 hash of a dot-separated waVersion
-var waVersionHash [16]byte
-
-func init() {
-	waVersionHash = waVersion.Hash()
-}
+var waVersionHash = waVersion.Hash()
 
 // GetWAVersion gets the current WhatsApp web client version.
 func GetWAVersion() WAVersionContainer {
@@ -98,38 +96,63 @@ func SetWAVersion(version WAVersionContainer) {
 	}
 	waVersion = version
 	waVersionHash = version.Hash()
+	BaseClientPayload.UserAgent.AppVersion = waVersion.ProtoAppVersion()
 }
 
-var BaseClientPayload = &waProto.ClientPayload{
-	UserAgent: &waProto.ClientPayload_UserAgent{
-		Platform:       waProto.ClientPayload_UserAgent_WEB.Enum(),
-		ReleaseChannel: waProto.ClientPayload_UserAgent_RELEASE.Enum(),
+var BaseClientPayload = &waWa6.ClientPayload{
+	UserAgent: &waWa6.ClientPayload_UserAgent{
+		Platform:       waWa6.ClientPayload_UserAgent_WEB.Enum(),
+		ReleaseChannel: waWa6.ClientPayload_UserAgent_RELEASE.Enum(),
 		AppVersion:     waVersion.ProtoAppVersion(),
 		Mcc:            proto.String("000"),
 		Mnc:            proto.String("000"),
-		OsVersion:      proto.String("0.1.0"),
+		OsVersion:      proto.String("0.1"),
 		Manufacturer:   proto.String(""),
 		Device:         proto.String("Desktop"),
-		OsBuildNumber:  proto.String("0.1.0"),
+		OsBuildNumber:  proto.String("0.1"),
 
 		LocaleLanguageIso6391:       proto.String("en"),
-		LocaleCountryIso31661Alpha2: proto.String("en"),
+		LocaleCountryIso31661Alpha2: proto.String("US"),
 	},
-	WebInfo: &waProto.ClientPayload_WebInfo{
-		WebSubPlatform: waProto.ClientPayload_WebInfo_WEB_BROWSER.Enum(),
+	WebInfo: &waWa6.ClientPayload_WebInfo{
+		WebSubPlatform: waWa6.ClientPayload_WebInfo_WEB_BROWSER.Enum(),
 	},
-	ConnectType:   waProto.ClientPayload_WIFI_UNKNOWN.Enum(),
-	ConnectReason: waProto.ClientPayload_USER_ACTIVATED.Enum(),
+	ConnectType:   waWa6.ClientPayload_WIFI_UNKNOWN.Enum(),
+	ConnectReason: waWa6.ClientPayload_USER_ACTIVATED.Enum(),
 }
 
-var DeviceProps = &waProto.DeviceProps{
+var DeviceProps = &waCompanionReg.DeviceProps{
 	Os: proto.String("whatsmeow"),
-	Version: &waProto.DeviceProps_AppVersion{
+	Version: &waCompanionReg.DeviceProps_AppVersion{
 		Primary:   proto.Uint32(0),
 		Secondary: proto.Uint32(1),
 		Tertiary:  proto.Uint32(0),
 	},
-	PlatformType:    waProto.DeviceProps_UNKNOWN.Enum(),
+	HistorySyncConfig: &waCompanionReg.DeviceProps_HistorySyncConfig{
+		FullSyncDaysLimit:                        nil,
+		FullSyncSizeMbLimit:                      nil,
+		StorageQuotaMb:                           proto.Uint32(10240),
+		InlineInitialPayloadInE2EeMsg:            proto.Bool(true),
+		RecentSyncDaysLimit:                      nil,
+		SupportCallLogHistory:                    proto.Bool(true),
+		SupportBotUserAgentChatHistory:           proto.Bool(true),
+		SupportCagReactionsAndPolls:              proto.Bool(true),
+		SupportBizHostedMsg:                      proto.Bool(true),
+		SupportRecentSyncChunkMessageCountTuning: proto.Bool(true),
+		SupportHostedGroupMsg:                    proto.Bool(true),
+		SupportFbidBotChatHistory:                proto.Bool(true),
+		SupportAddOnHistorySyncMigration:         nil,
+		SupportMessageAssociation:                proto.Bool(true),
+		SupportGroupHistory:                      proto.Bool(true),
+		OnDemandReady:                            nil,
+		SupportGuestChat:                         nil,
+		CompleteOnDemandReady:                    nil,
+		ThumbnailSyncDaysLimit:                   proto.Uint32(60),
+		InitialSyncMaxMessagesPerChat:            nil,
+		SupportManusHistory:                      proto.Bool(true),
+		SupportHatchHistory:                      proto.Bool(true),
+	},
+	PlatformType:    waCompanionReg.DeviceProps_UNKNOWN.Enum(),
 	RequireFullSync: proto.Bool(false),
 }
 
@@ -142,37 +165,46 @@ func SetOSInfo(name string, version [3]uint32) {
 	BaseClientPayload.UserAgent.OsBuildNumber = BaseClientPayload.UserAgent.OsVersion
 }
 
-func (device *Device) getRegistrationPayload() *waProto.ClientPayload {
-	payload := proto.Clone(BaseClientPayload).(*waProto.ClientPayload)
+func (device *Device) getRegistrationPayload() *waWa6.ClientPayload {
+	payload := proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
 	regID := make([]byte, 4)
 	binary.BigEndian.PutUint32(regID, device.RegistrationID)
 	preKeyID := make([]byte, 4)
 	binary.BigEndian.PutUint32(preKeyID, device.SignedPreKey.KeyID)
 	deviceProps, _ := proto.Marshal(DeviceProps)
-	payload.DevicePairingData = &waProto.ClientPayload_DevicePairingRegistrationData{
+	payload.DevicePairingData = &waWa6.ClientPayload_DevicePairingRegistrationData{
 		ERegid:      regID,
 		EKeytype:    []byte{ecc.DjbType},
 		EIdent:      device.IdentityKey.Pub[:],
-		ESkeyId:     preKeyID[1:],
+		ESkeyID:     preKeyID[1:],
 		ESkeyVal:    device.SignedPreKey.Pub[:],
 		ESkeySig:    device.SignedPreKey.Signature[:],
 		BuildHash:   waVersionHash[:],
 		DeviceProps: deviceProps,
 	}
 	payload.Passive = proto.Bool(false)
+	payload.Pull = proto.Bool(false)
 	return payload
 }
 
-func (device *Device) getLoginPayload() *waProto.ClientPayload {
-	payload := proto.Clone(BaseClientPayload).(*waProto.ClientPayload)
+func (device *Device) getLoginPayload() *waWa6.ClientPayload {
+	payload := proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
 	payload.Username = proto.Uint64(device.ID.UserInt())
 	payload.Device = proto.Uint32(uint32(device.ID.Device))
 	payload.Passive = proto.Bool(true)
+	payload.Pull = proto.Bool(true)
+	payload.LidDbMigrated = proto.Bool(true)
+	if payload.Lc == nil {
+		payload.Lc = proto.Int32(1)
+	}
 	return payload
 }
 
-func (device *Device) GetClientPayload() *waProto.ClientPayload {
+func (device *Device) GetClientPayload() *waWa6.ClientPayload {
 	if device.ID != nil {
+		if *device.ID == types.EmptyJID {
+			panic(fmt.Errorf("GetClientPayload called with empty JID"))
+		}
 		return device.getLoginPayload()
 	} else {
 		return device.getRegistrationPayload()

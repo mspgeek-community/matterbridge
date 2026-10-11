@@ -5,8 +5,11 @@ import (
 	"io/ioutil"
 	"strconv"
 	"testing"
+	"time"
 
+	"github.com/mspgeek-community/matterbridge/bridge"
 	"github.com/mspgeek-community/matterbridge/bridge/config"
+	"github.com/mspgeek-community/matterbridge/bridge/helper"
 	"github.com/mspgeek-community/matterbridge/gateway/bridgemap"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -506,4 +509,90 @@ func BenchmarkTengo(b *testing.B) {
 			return
 		}
 	}
+}
+
+func TestSendMessageDropsEditOfUnknownMessage(t *testing.T) {
+	r := maketestRouter(testconfig2)
+	gw := r.Gateways["bridge1"]
+	dest := gw.Bridges["slack.test"]
+	channel := gw.Channels["testingslack.test"]
+	msg := &config.Message{
+		Text: "edited", Channel: "general", Account: "discord.test", Gateway: "bridge1",
+		Protocol: "discord", Username: "test", ID: "123", Edit: true,
+	}
+	// The slack bridge is not connected; reaching Send would fail.
+	id, err := gw.SendMessage(msg, dest, channel, "", "")
+	assert.NoError(t, err)
+	assert.Equal(t, "", id)
+}
+
+type fakeMentioner struct {
+	bridge.Bridger
+	channels map[string]string
+	users    helper.NameIndex
+}
+
+func (f fakeMentioner) ChannelMention(name string) (string, bool) {
+	id, ok := f.channels[name]
+	return "<#" + id + ">", ok
+}
+
+func (f fakeMentioner) UserMention(names []string) (string, bool) {
+	id, ok := helper.ResolveUserByNames(f.users, names)
+	return "<@" + id + ">", ok
+}
+
+func TestResolveRefs(t *testing.T) {
+	ref := helper.ChannelRef("v-hudu")
+	file := config.FileInfo{Name: "a.png", Comment: "see " + ref}
+	src := config.Message{Text: "in " + ref + " not " + helper.ChannelRef("nope"), Extra: map[string][]interface{}{"file": {file}}}
+
+	discord := &bridge.Bridge{Bridger: fakeMentioner{channels: map[string]string{"v-hudu": "111"}}}
+	msg := src
+	resolveRefs(&msg, discord)
+	assert.Equal(t, "in <#111> not #nope", msg.Text)
+	assert.Equal(t, "see <#111>", msg.Extra["file"][0].(config.FileInfo).Comment)
+
+	other := &bridge.Bridge{}
+	msg2 := src
+	resolveRefs(&msg2, other)
+	assert.Equal(t, "in #v-hudu not #nope", msg2.Text)
+	assert.Equal(t, "see #v-hudu", msg2.Extra["file"][0].(config.FileInfo).Comment)
+
+	// The source message, shared by all destinations, is unchanged.
+	assert.Equal(t, "see "+ref, src.Extra["file"][0].(config.FileInfo).Comment)
+}
+
+func TestResolveUserRefs(t *testing.T) {
+	users := helper.NameIndex{}
+	users.Add("D1", "mendygreen", "Mendy Green [MSPGeek]")
+	ref := helper.UserRef("Mendy Green [MSPGeek]", "mendy.green")
+	unknown := helper.UserRef("Some One", "someone")
+	src := config.Message{
+		Text:  ref + "] yo " + unknown + " @typed",
+		Extra: map[string][]interface{}{"file": {config.FileInfo{Comment: "cc " + ref}}},
+	}
+
+	discord := &bridge.Bridge{Bridger: fakeMentioner{users: users}}
+	msg := src
+	resolveRefs(&msg, discord)
+	// The literal "]" typed after the mention stays: nothing is guessed.
+	assert.Equal(t, "<@D1>] yo @Some One @typed", msg.Text)
+	assert.Equal(t, "cc <@D1>", msg.Extra["file"][0].(config.FileInfo).Comment)
+
+	other := &bridge.Bridge{}
+	msg2 := src
+	resolveRefs(&msg2, other)
+	assert.Equal(t, "@Mendy Green [MSPGeek]] yo @Some One @typed", msg2.Text)
+	assert.Equal(t, "cc "+ref, src.Extra["file"][0].(config.FileInfo).Comment)
+}
+
+// A bridge removed after failing to start may still deliver messages; the
+// router used to dereference the missing bridge and crash.
+func TestRouterDropsMessagesFromRemovedBridge(t *testing.T) {
+	r := maketestRouter(testconfig2)
+	go r.handleReceive()
+	r.Message <- config.Message{Account: "slack.removed", Channel: "general", Text: "hi", Username: "x"}
+	r.Message <- config.Message{Account: "slack.removed", Event: config.EventUserTyping, Channel: "general"}
+	time.Sleep(100 * time.Millisecond) // a panic in handleReceive would abort the test binary
 }

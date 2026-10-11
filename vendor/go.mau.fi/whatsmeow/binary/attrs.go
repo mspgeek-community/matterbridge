@@ -30,7 +30,7 @@ func (n *Node) AttrGetter() *AttrUtility {
 }
 
 func (au *AttrUtility) GetJID(key string, require bool) (jidVal types.JID, ok bool) {
-	var val interface{}
+	var val any
 	if val, ok = au.Attrs[key]; !ok {
 		if require {
 			au.Errors = append(au.Errors, fmt.Errorf("didn't find required JID attribute '%s'", key))
@@ -69,7 +69,7 @@ func (au *AttrUtility) JID(key string) types.JID {
 }
 
 func (au *AttrUtility) GetString(key string, require bool) (strVal string, ok bool) {
-	var val interface{}
+	var val any
 	if val, ok = au.Attrs[key]; !ok {
 		if require {
 			au.Errors = append(au.Errors, fmt.Errorf("didn't find required attribute '%s'", key))
@@ -123,6 +123,16 @@ func (au *AttrUtility) GetUnixTime(key string, require bool) (time.Time, bool) {
 	}
 }
 
+func (au *AttrUtility) GetUnixMilli(key string, require bool) (time.Time, bool) {
+	if intVal, ok := au.GetInt64(key, require); !ok {
+		return time.Time{}, false
+	} else if intVal == 0 {
+		return time.Time{}, true
+	} else {
+		return time.UnixMilli(intVal), true
+	}
+}
+
 // OptionalString returns the string under the given key.
 func (au *AttrUtility) OptionalString(key string) string {
 	strVal, _ := au.GetString(key, false)
@@ -173,6 +183,16 @@ func (au *AttrUtility) OptionalUnixTime(key string) time.Time {
 
 func (au *AttrUtility) UnixTime(key string) time.Time {
 	val, _ := au.GetUnixTime(key, true)
+	return val
+}
+
+func (au *AttrUtility) OptionalUnixMilli(key string) time.Time {
+	val, _ := au.GetUnixMilli(key, false)
+	return val
+}
+
+func (au *AttrUtility) UnixMilli(key string) time.Time {
+	val, _ := au.GetUnixMilli(key, true)
 	return val
 }
 

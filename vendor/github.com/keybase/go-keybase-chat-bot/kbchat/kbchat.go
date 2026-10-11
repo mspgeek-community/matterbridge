@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"sync"
 	"time"
@@ -17,6 +18,8 @@ import (
 	"github.com/keybase/go-keybase-chat-bot/kbchat/types/keybase1"
 	"github.com/keybase/go-keybase-chat-bot/kbchat/types/stellar1"
 )
+
+var validUsernameRe = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 // SubscriptionMessage contains a message and conversation object
 type SubscriptionMessage struct {
@@ -140,6 +143,8 @@ type RunOptions struct {
 	DisableBotLiteMode bool
 	// Number of processes to spin up to connect to the keybase service
 	NumPipes int
+	// Optional, used for debugging to identify the bot.
+	DebugTag string
 }
 
 func (r RunOptions) Location() string {
@@ -155,7 +160,7 @@ func (r RunOptions) Command(args ...string) *exec.Cmd {
 		cmd = append(cmd, "--home", r.HomeDir)
 	}
 	cmd = append(cmd, args...)
-	return exec.Command(r.Location(), cmd...)
+	return exec.Command(r.Location(), cmd...) //nolint:gosec,noctx // G204: command location controlled by RunOptions, no context available at API level
 }
 
 // Start fires up the Keybase JSON API in stdin/stdout mode
@@ -261,32 +266,49 @@ func (a *API) getUsername(runOpts RunOptions) (username string, err error) {
 	return username, nil
 }
 
-func (a *API) auth() (string, error) {
-	username, err := a.getUsername(a.runOpts)
+func (a *API) auth() (username string, err error) {
+	defer a.Trace(&err, "auth(un:%s)", username)()
+	username, err = a.getUsername(a.runOpts)
 	if err == nil {
-		return username, nil
-	}
-	if a.runOpts.Oneshot == nil {
-		return "", err
-	}
-	username = ""
-	// If a paper key is specified, then login with oneshot mode (logout first)
-	if a.runOpts.Oneshot != nil {
-		if username == a.runOpts.Oneshot.Username {
-			// just get out if we are on the desired user already
+		// Successfully authenticated - check if we need to switch users
+		if a.runOpts.Oneshot != nil && username != a.runOpts.Oneshot.Username {
+			// Logged in as wrong user, need to switch
+			a.Debug("auth: logged in as %s, but need %s, switching", username, a.runOpts.Oneshot.Username)
+			// Continue to logout + oneshot below
+		} else {
+			// Already logged in as correct user (or no Oneshot configured)
+			a.Debug("auth: already logged in %s", username)
 			return username, nil
 		}
-		if err := a.runOpts.Command("logout", "-f").Run(); err != nil {
+	} else {
+		// Authentication failed
+		if a.runOpts.Oneshot == nil {
+			a.Debug("auth: oneshot not configured, aborting")
 			return "", err
 		}
-		if err := a.runOpts.Command("oneshot", "--username", a.runOpts.Oneshot.Username, "--paperkey",
-			a.runOpts.Oneshot.PaperKey).Run(); err != nil {
-			return "", err
-		}
-		username = a.runOpts.Oneshot.Username
-		return username, nil
+		// Continue to logout + oneshot below
 	}
-	return "", errors.New("unable to auth")
+
+	// If we get here, we need to do oneshot login (logout first)
+	if !validUsernameRe.MatchString(a.runOpts.Oneshot.Username) {
+		return "", fmt.Errorf("invalid oneshot username %q: must match [a-zA-Z0-9_]+", a.runOpts.Oneshot.Username)
+	}
+	if err := a.runOpts.Command("logout", "-f").Run(); err != nil {
+		return "", err
+	}
+	// Pass the paper key via env var rather than argv to avoid local disclosure via ps/proc.
+	// keybase oneshot reads KEYBASE_PAPERKEY before prompting stdin (cmd_oneshot.go:getOption).
+	// Strip any inherited KEYBASE_PAPERKEY first: getenv returns the first match, so an
+	// existing entry in the parent environment would shadow ours silently.
+	oneshotCmd := a.runOpts.Command("oneshot", "--username", a.runOpts.Oneshot.Username)
+	// Prepend so our value is found first; getenv returns the first match, so any
+	// pre-existing KEYBASE_PAPERKEY in the parent environment is silently shadowed.
+	oneshotCmd.Env = append([]string{"KEYBASE_PAPERKEY=" + a.runOpts.Oneshot.PaperKey}, os.Environ()...)
+	if err := oneshotCmd.Run(); err != nil {
+		return "", err
+	}
+	username = a.runOpts.Oneshot.Username
+	return username, nil
 }
 
 func (a *API) startPipes() (err error) {
@@ -316,7 +338,7 @@ func (a *API) startPipes() (err error) {
 	cmd := a.runOpts.Command("chat", "notification-settings", fmt.Sprintf("-disable-typing=%v", !a.runOpts.EnableTyping))
 	if err = cmd.Run(); err != nil {
 		// This is a performance optimization but isn't a fatal error.
-		a.Debug("unable to set notifiation settings %v", err)
+		a.Debug("unable to set notification settings %v", err)
 	}
 
 	// Startup NumPipes processes to the keybase chat api
@@ -345,6 +367,9 @@ func (a *API) startPipes() (err error) {
 func (a *API) getAPIPipes() (*apiPipe, error) {
 	a.Lock()
 	defer a.Unlock()
+	if len(a.pipes) == 0 {
+		return nil, errAPIDisconnected
+	}
 	idx := a.pipeIdx % len(a.pipes)
 	a.pipeIdx++
 	pipe := a.pipes[idx]
@@ -358,7 +383,7 @@ func (a *API) GetUsername() string {
 	return a.username
 }
 
-func (a *API) doSend(arg interface{}) (resp SendResponse, err error) {
+func (a *API) doSend(arg any) (resp SendResponse, err error) {
 	bArg, err := json.Marshal(arg)
 	if err != nil {
 		return SendResponse{}, fmt.Errorf("unable to send arg: %+v: %v", arg, err)
@@ -370,7 +395,7 @@ func (a *API) doSend(arg interface{}) (resp SendResponse, err error) {
 	pipe.Lock()
 	defer pipe.Unlock()
 
-	if _, err := io.WriteString(pipe.input, string(bArg)); err != nil {
+	if _, err := io.Writer.Write(pipe.input, bArg); err != nil {
 		return SendResponse{}, err
 	}
 	responseRaw, err := pipe.output.ReadBytes('\n')
@@ -418,13 +443,21 @@ func (a *API) registerSubscription(sub *Subscription) {
 
 // Listen fires of a background loop and puts chat messages and wallet
 // events into channels
-func (a *API) Listen(opts ListenOptions) (*Subscription, error) {
-	done := make(chan struct{})
-	sub := NewSubscription()
+func (a *API) Listen(opts ListenOptions) (sub *Subscription, err error) {
+	defer a.Trace(&err, "Listen(%s)", a.runOpts.DebugTag)()
+	done := make(chan struct{}, 1)
+	sub = NewSubscription()
 	a.registerSubscription(sub)
 	pause := 2 * time.Second
 	readScanner := func(boutput *bufio.Scanner) {
-		defer func() { done <- struct{}{} }()
+		defer func() {
+			// Recover from "send on closed channel" panics that can occur when the
+			// subscription shuts down while readScanner is mid-send.
+			if r := recover(); r != nil {
+				a.Debug("readScanner: recovered from panic: %v", r)
+			}
+			done <- struct{}{}
+		}()
 		for {
 			select {
 			case <-sub.shutdownCh:
@@ -432,18 +465,26 @@ func (a *API) Listen(opts ListenOptions) (*Subscription, error) {
 				return
 			default:
 			}
-			boutput.Scan()
-			t := boutput.Text()
 			submitErr := func(err error) {
 				if len(sub.errorCh)*2 > cap(sub.errorCh) {
 					a.Debug("large errorCh queue: len: %d cap: %d ", len(sub.errorCh), cap(sub.errorCh))
 				}
 				sub.errorCh <- err
 			}
+			if !boutput.Scan() {
+				if err := boutput.Err(); err != nil {
+					submitErr(err)
+				}
+				return
+			}
+			t := boutput.Text()
+			if t == "" {
+				continue
+			}
 			var typeHolder TypeHolder
 			if err := json.Unmarshal([]byte(t), &typeHolder); err != nil {
 				submitErr(fmt.Errorf("err: %v, data: %v", err, t))
-				break
+				continue
 			}
 			switch typeHolder.Type {
 			case "chat":
@@ -519,9 +560,13 @@ func (a *API) Listen(opts ListenOptions) (*Subscription, error) {
 			}
 
 			if attempts >= maxAttempts {
-				if err := a.LogSend("Listen: failed to auth, giving up"); err != nil {
-					a.Debug("Listen: logsend failed to send: %v", err)
-				}
+				// Run LogSend in a goroutine: keybase may be unresponsive (the cause of the
+				// auth failures), and blocking here would delay the panic indefinitely.
+				go func() {
+					if err := a.LogSend("Listen: failed to auth, giving up"); err != nil {
+						a.Debug("Listen: logsend failed to send: %v", err)
+					}
+				}()
 				panic("Listen: failed to auth, giving up")
 			}
 			attempts++
@@ -570,7 +615,7 @@ func (a *API) Listen(opts ListenOptions) (*Subscription, error) {
 			if err := p.Wait(); err != nil {
 				stderrBytes, rerr := io.ReadAll(stderr)
 				if rerr != nil {
-					stderrBytes = []byte(fmt.Sprintf("failed to get stderr: %v", rerr))
+					stderrBytes = fmt.Appendf(nil, "failed to get stderr: %v", rerr)
 				}
 				a.Debug("Listen: failed to Wait for command, restarting pipes: %s (```%s```)", err, stderrBytes)
 				if err := a.startPipes(); err != nil {
@@ -584,9 +629,13 @@ func (a *API) Listen(opts ListenOptions) (*Subscription, error) {
 }
 
 func (a *API) LogSend(feedback string) error {
-	feedback = "go-keybase-chat-bot log send\n" +
-		"username: " + a.GetUsername() + "\n" +
-		feedback
+	var username string
+	if len(a.GetUsername()) != 0 {
+		username = a.GetUsername() + " (logged in)"
+	} else if a.runOpts.Oneshot != nil {
+		username = a.runOpts.Oneshot.Username + " (config)"
+	}
+	feedback = fmt.Sprintf("go-keybase-chat-bot log send (%s)\n username: %s\n%s", a.runOpts.DebugTag, username, feedback)
 
 	args := []string{
 		"log", "send",

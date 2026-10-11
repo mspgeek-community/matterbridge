@@ -29,8 +29,8 @@ const (
 	MinPreKeyCount = 5
 )
 
-func (cli *Client) getServerPreKeyCount() (int, error) {
-	resp, err := cli.sendIQ(infoQuery{
+func (cli *Client) getServerPreKeyCount(ctx context.Context) (int, error) {
+	resp, err := cli.sendIQ(ctx, infoQuery{
 		Namespace: "encrypt",
 		Type:      "get",
 		To:        types.ServerJID,
@@ -47,11 +47,11 @@ func (cli *Client) getServerPreKeyCount() (int, error) {
 	return val, ag.Error()
 }
 
-func (cli *Client) uploadPreKeys() {
+func (cli *Client) uploadPreKeys(ctx context.Context, initialUpload bool) {
 	cli.uploadPreKeysLock.Lock()
 	defer cli.uploadPreKeysLock.Unlock()
 	if cli.lastPreKeyUpload.Add(10 * time.Minute).After(time.Now()) {
-		sc, _ := cli.getServerPreKeyCount()
+		sc, _ := cli.getServerPreKeyCount(ctx)
 		if sc >= WantedPreKeyCount {
 			cli.Log.Debugf("Canceling prekey upload request due to likely race condition")
 			return
@@ -59,13 +59,17 @@ func (cli *Client) uploadPreKeys() {
 	}
 	var registrationIDBytes [4]byte
 	binary.BigEndian.PutUint32(registrationIDBytes[:], cli.Store.RegistrationID)
-	preKeys, err := cli.Store.PreKeys.GetOrGenPreKeys(WantedPreKeyCount)
+	wantedCount := WantedPreKeyCount
+	if initialUpload {
+		wantedCount = 812
+	}
+	preKeys, err := cli.Store.PreKeys.GetOrGenPreKeys(ctx, uint32(wantedCount))
 	if err != nil {
 		cli.Log.Errorf("Failed to get prekeys to upload: %v", err)
 		return
 	}
 	cli.Log.Infof("Uploading %d new prekeys to server", len(preKeys))
-	_, err = cli.sendIQ(infoQuery{
+	_, err = cli.sendIQ(ctx, infoQuery{
 		Namespace: "encrypt",
 		Type:      "set",
 		To:        types.ServerJID,
@@ -82,11 +86,34 @@ func (cli *Client) uploadPreKeys() {
 		return
 	}
 	cli.Log.Debugf("Got response to uploading prekeys")
-	err = cli.Store.PreKeys.MarkPreKeysAsUploaded(preKeys[len(preKeys)-1].KeyID)
+	err = cli.Store.PreKeys.MarkPreKeysAsUploaded(ctx, preKeys[len(preKeys)-1].KeyID)
 	if err != nil {
 		cli.Log.Warnf("Failed to mark prekeys as uploaded: %v", err)
+		return
 	}
 	cli.lastPreKeyUpload = time.Now()
+	cli.PreKeysUploaded.Set()
+}
+
+func (cli *Client) fetchPreKeysNoError(ctx context.Context, retryDevices []types.JID) map[types.JID]*prekey.Bundle {
+	if len(retryDevices) == 0 {
+		return nil
+	}
+	bundlesResp, err := cli.fetchPreKeys(ctx, retryDevices)
+	if err != nil {
+		cli.Log.Warnf("Failed to fetch prekeys for %v with no existing session: %v", retryDevices, err)
+		return nil
+	}
+	bundles := make(map[types.JID]*prekey.Bundle, len(retryDevices))
+	for _, jid := range retryDevices {
+		resp := bundlesResp[jid]
+		if resp.err != nil {
+			cli.Log.Warnf("Failed to fetch prekey for %s: %v", jid, resp.err)
+			continue
+		}
+		bundles[jid] = resp.bundle
+	}
+	return bundles
 }
 
 type preKeyResp struct {
@@ -103,8 +130,7 @@ func (cli *Client) fetchPreKeys(ctx context.Context, users []types.JID) (map[typ
 			"reason": "identity",
 		}
 	}
-	resp, err := cli.sendIQ(infoQuery{
-		Context:   ctx,
+	resp, err := cli.sendIQ(ctx, infoQuery{
 		Namespace: "encrypt",
 		Type:      "get",
 		To:        types.ServerJID,
@@ -125,7 +151,6 @@ func (cli *Client) fetchPreKeys(ctx context.Context, users []types.JID) (map[typ
 			continue
 		}
 		jid := child.AttrGetter().JID("jid")
-		jid.AD = true
 		bundle, err := nodeToPreKeyBundle(uint32(jid.Device), child)
 		respData[jid] = preKeyResp{bundle, err}
 	}
@@ -155,7 +180,7 @@ func preKeyToNode(key *keys.PreKey) waBinary.Node {
 func nodeToPreKeyBundle(deviceID uint32, node waBinary.Node) (*prekey.Bundle, error) {
 	errorNode, ok := node.GetOptionalChildByTag("error")
 	if ok && errorNode.Tag == "error" {
-		return nil, fmt.Errorf("got error getting prekeys: %s", errorNode.XMLString())
+		return nil, fmt.Errorf("got error getting prekeys: %s", &errorNode)
 	}
 
 	registrationBytes, ok := node.GetChildByTag("registration").Content.([]byte)
@@ -175,19 +200,34 @@ func nodeToPreKeyBundle(deviceID uint32, node waBinary.Node) (*prekey.Bundle, er
 	}
 	identityKeyPub := *(*[32]byte)(identityKeyRaw)
 
-	preKey, err := nodeToPreKey(keysNode.GetChildByTag("key"))
-	if err != nil {
-		return nil, fmt.Errorf("invalid prekey in prekey response: %w", err)
+	preKeyNode, ok := keysNode.GetOptionalChildByTag("key")
+	preKey := &keys.PreKey{}
+	if ok {
+		var err error
+		preKey, err = nodeToPreKey(preKeyNode)
+		if err != nil {
+			return nil, fmt.Errorf("invalid prekey in prekey response: %w", err)
+		}
 	}
+
 	signedPreKey, err := nodeToPreKey(keysNode.GetChildByTag("skey"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid signed prekey in prekey response: %w", err)
 	}
 
-	return prekey.NewBundle(registrationID, deviceID,
-		optional.NewOptionalUint32(preKey.KeyID), signedPreKey.KeyID,
-		ecc.NewDjbECPublicKey(*preKey.Pub), ecc.NewDjbECPublicKey(*signedPreKey.Pub), *signedPreKey.Signature,
-		identity.NewKey(ecc.NewDjbECPublicKey(identityKeyPub))), nil
+	var bundle *prekey.Bundle
+	if ok {
+		bundle = prekey.NewBundle(registrationID, deviceID,
+			optional.NewOptionalUint32(preKey.KeyID), signedPreKey.KeyID,
+			ecc.NewDjbECPublicKey(*preKey.Pub), ecc.NewDjbECPublicKey(*signedPreKey.Pub), *signedPreKey.Signature,
+			identity.NewKey(ecc.NewDjbECPublicKey(identityKeyPub)))
+	} else {
+		bundle = prekey.NewBundle(registrationID, deviceID, optional.NewEmptyUint32(), signedPreKey.KeyID,
+			nil, ecc.NewDjbECPublicKey(*signedPreKey.Pub), *signedPreKey.Signature,
+			identity.NewKey(ecc.NewDjbECPublicKey(identityKeyPub)))
+	}
+
+	return bundle, nil
 }
 
 func nodeToPreKey(node waBinary.Node) (*keys.PreKey, error) {

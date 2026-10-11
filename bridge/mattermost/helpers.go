@@ -1,14 +1,15 @@
 package bmattermost
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
+	"github.com/matterbridge/matterclient"
+	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mspgeek-community/matterbridge/bridge/config"
 	"github.com/mspgeek-community/matterbridge/bridge/helper"
 	"github.com/mspgeek-community/matterbridge/matterhook"
-	"github.com/matterbridge/matterclient"
-	"github.com/mattermost/mattermost-server/v6/model"
 )
 
 func (b *Bmattermost) doConnectWebhookBind() error {
@@ -82,7 +83,7 @@ func (b *Bmattermost) apiLogin() error {
 	b.mc.NoTLS = b.GetBool("NoTLS")
 	b.Log.Infof("Connecting %s (team: %s) on %s", b.GetString("Login"), b.GetString("Team"), b.GetString("Server"))
 
-	if err := b.mc.Login(); err != nil {
+	if err := b.mc.Login(context.TODO()); err != nil {
 		return err
 	}
 
@@ -171,6 +172,7 @@ func (b *Bmattermost) sendWebhook(msg config.Message) (string, error) {
 }
 
 // skipMessages returns true if this message should not be handled
+//
 //nolint:gocyclo,cyclop
 func (b *Bmattermost) skipMessage(message *matterclient.Message) bool {
 	// Handle join/leave
@@ -265,7 +267,7 @@ func (b *Bmattermost) getChannelID(name string) string {
 		return idcheck[1]
 	}
 
-	return b.mc.GetChannelID(name, b.TeamID)
+	return b.mc.GetChannelID(context.TODO(), name, b.TeamID)
 }
 
 func (b *Bmattermost) getChannelName(id string) string {

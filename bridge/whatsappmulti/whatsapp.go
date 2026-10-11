@@ -12,9 +12,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/mdp/qrterminal"
 	"github.com/mspgeek-community/matterbridge/bridge"
 	"github.com/mspgeek-community/matterbridge/bridge/config"
-	"github.com/mdp/qrterminal"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/binary/proto"
@@ -122,12 +122,12 @@ func (b *Bwhatsapp) Connect() error {
 
 	b.Log.Infoln("WhatsApp connection successful")
 
-	b.contacts, err = b.wc.Store.Contacts.GetAllContacts()
+	b.contacts, err = b.wc.Store.Contacts.GetAllContacts(context.TODO())
 	if err != nil {
 		return errors.New("failed to get contacts: " + err.Error())
 	}
 
-	b.joinedGroups, err = b.wc.GetJoinedGroups()
+	b.joinedGroups, err = b.wc.GetJoinedGroups(context.TODO())
 	if err != nil {
 		return errors.New("failed to get list of joined groups: " + err.Error())
 	}
@@ -239,10 +239,10 @@ func (b *Bwhatsapp) PostDocumentMessage(msg config.Message, filetype string) (st
 		Mimetype:      &filetype,
 		Caption:       &caption,
 		MediaKey:      resp.MediaKey,
-		FileEncSha256: resp.FileEncSHA256,
-		FileSha256:    resp.FileSHA256,
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
 		FileLength:    goproto.Uint64(resp.FileLength),
-		Url:           &resp.URL,
+		URL:           &resp.URL,
 		DirectPath:    &resp.DirectPath,
 		ContextInfo:   ctx,
 	}
@@ -277,10 +277,10 @@ func (b *Bwhatsapp) PostImageMessage(msg config.Message, filetype string) (strin
 		Mimetype:      &filetype,
 		Caption:       &caption,
 		MediaKey:      resp.MediaKey,
-		FileEncSha256: resp.FileEncSHA256,
-		FileSha256:    resp.FileSHA256,
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
 		FileLength:    goproto.Uint64(resp.FileLength),
-		Url:           &resp.URL,
+		URL:           &resp.URL,
 		DirectPath:    &resp.DirectPath,
 		ContextInfo:   ctx,
 	}
@@ -311,10 +311,10 @@ func (b *Bwhatsapp) PostVideoMessage(msg config.Message, filetype string) (strin
 		Mimetype:      &filetype,
 		Caption:       &caption,
 		MediaKey:      resp.MediaKey,
-		FileEncSha256: resp.FileEncSHA256,
-		FileSha256:    resp.FileSHA256,
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
 		FileLength:    goproto.Uint64(resp.FileLength),
-		Url:           &resp.URL,
+		URL:           &resp.URL,
 		DirectPath:    &resp.DirectPath,
 		ContextInfo:   ctx,
 	}
@@ -344,10 +344,10 @@ func (b *Bwhatsapp) PostAudioMessage(msg config.Message, filetype string) (strin
 	message.AudioMessage = &proto.AudioMessage{
 		Mimetype:      &filetype,
 		MediaKey:      resp.MediaKey,
-		FileEncSha256: resp.FileEncSHA256,
-		FileSha256:    resp.FileSHA256,
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
 		FileLength:    goproto.Uint64(resp.FileLength),
-		Url:           &resp.URL,
+		URL:           &resp.URL,
 		DirectPath:    &resp.DirectPath,
 		ContextInfo:   ctx,
 	}
@@ -383,7 +383,7 @@ func (b *Bwhatsapp) Send(msg config.Message) (string, error) {
 			return "", nil
 		}
 
-		_, err := b.wc.RevokeMessage(groupJID, msg.ID)
+		_, err := b.wc.RevokeMessage(context.TODO(), groupJID, msg.ID)
 
 		return "", err
 	}

@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/mspgeek-community/matterbridge/bridge/config"
 	"github.com/mspgeek-community/matterbridge/gateway"
@@ -63,6 +64,18 @@ func main() {
 		logger.Fatalf("Starting gateway failed: %s", err)
 	}
 	if err = r.Start(); err != nil {
+		// Exiting straight away lets a container restart policy turn a
+		// persistent failure into a tight reconnect loop. For Discord this
+		// burns through the 1000 identifies/day limit and gets the bot
+		// token reset, so slow the loop down before exiting.
+		delay := cfg.BridgeValues().General.StartupFailureDelay
+		if delay == 0 {
+			delay = 300
+		}
+		if delay > 0 {
+			logger.Errorf("Starting gateway failed: %s. Exiting in %d seconds", err, delay)
+			time.Sleep(time.Duration(delay) * time.Second)
+		}
 		logger.Fatalf("Starting gateway failed: %s", err)
 	}
 	logger.Printf("Gateway(s) started successfully. Now relaying messages")

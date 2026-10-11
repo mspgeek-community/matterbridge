@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	lru "github.com/hashicorp/golang-lru"
@@ -17,12 +18,21 @@ import (
 const (
 	MessageLength = 1950
 	cFileUpload   = "file_upload"
+	cEdit         = "edit "
 )
 
 type Bdiscord struct {
 	*bridge.Config
 
 	c *discordgo.Session
+
+	// connectMutex serialises Connect and Disconnect.
+	connectMutex sync.Mutex
+	// sessionMutex guards activeSession, the session whose loss of gateway
+	// connection must trigger a reconnect through the gateway.
+	sessionMutex  sync.Mutex
+	activeSession *discordgo.Session
+	identify      *identifyLimiter
 
 	nick    string
 	userID  string
@@ -35,6 +45,10 @@ type Bdiscord struct {
 	membersMutex  sync.RWMutex
 	userMemberMap map[string]*discordgo.Member
 	nickMemberMap map[string]*discordgo.Member
+	// memberIndex resolves normalized names to user IDs for @mentions; it is
+	// rebuilt from userMemberMap when memberIndexDirty is set.
+	memberIndex      helper.NameIndex
+	memberIndexDirty bool
 
 	// Webhook specific logic
 	useAutoWebhooks bool
@@ -49,8 +63,9 @@ func New(cfg *bridge.Config) bridge.Bridger {
 	}
 
 	b := &Bdiscord{
-		Config: cfg,
-		cache:  newCache,
+		Config:   cfg,
+		cache:    newCache,
+		identify: newIdentifyLimiter(),
 	}
 
 	b.userMemberMap = make(map[string]*discordgo.Member)
@@ -65,6 +80,20 @@ func New(cfg *bridge.Config) bridge.Bridger {
 }
 
 func (b *Bdiscord) Connect() error {
+	b.connectMutex.Lock()
+	defer b.connectMutex.Unlock()
+
+	err := b.connect()
+	if err != nil && b.c != nil {
+		// Don't leak a half-initialised session: it would keep its gateway
+		// connection (and its own reconnect attempts) alive.
+		b.setActiveSession(nil)
+		b.c.Close()
+	}
+	return err
+}
+
+func (b *Bdiscord) connect() error {
 	var err error
 	token := b.GetString("Token")
 	b.Log.Info("Connecting")
@@ -80,17 +109,28 @@ func (b *Bdiscord) Connect() error {
 	if err != nil {
 		return err
 	}
-	b.Log.Info("Connection succeeded")
+	// discordgo's built-in reconnect resets its backoff after every Open()
+	// and re-identifies immediately on an Invalid Session, which can burn
+	// through Discord's 1000 identifies/day limit and get the token reset.
+	// Reconnects are handled by the gateway instead, see onDisconnect.
+	b.c.ShouldReconnectOnError = false
+	b.c.AddHandler(b.onDisconnect)
 	// Add privileged intent for guild member tracking. This is needed to track nicks
 	// for display names and @mention translation
 	b.c.Identify.Intents = discordgo.MakeIntent(discordgo.IntentsAllWithoutPrivileged |
 		discordgo.IntentsGuildMembers)
 
+	if wait := b.identify.reserve(); wait > 0 {
+		b.Log.Warnf("Discord reconnecting too often, waiting %s before connecting", wait.Round(time.Second))
+		time.Sleep(wait)
+	}
 	err = b.c.Open()
 	if err != nil {
 		return err
 	}
-	guilds, err := b.c.UserGuilds(100, "", "")
+	b.setActiveSession(b.c)
+	b.Log.Info("Connection succeeded")
+	guilds, err := b.c.UserGuilds(100, "", "", false)
 	if err != nil {
 		return err
 	}
@@ -102,8 +142,10 @@ func (b *Bdiscord) Connect() error {
 	b.nick = userinfo.Username
 	b.userID = userinfo.ID
 
-	// Try and find this account's guild, and populate channels
+	// Try and find this account's guild, and populate channels.
+	// Reset first, Connect is called again on every reconnect.
 	b.channelsMutex.Lock()
+	b.guildID = ""
 	for _, guild := range guilds {
 		// Skip, if the server name does not match the visible name or the ID
 		if guild.Name != serverName && guild.ID != serverName {
@@ -113,15 +155,16 @@ func (b *Bdiscord) Connect() error {
 		// Complain about an ambiguous Server setting. Two Discord servers could have the same title!
 		// For IDs, practically this will never happen. It would only trigger if some server's name is also an ID.
 		if b.guildID != "" {
+			b.channelsMutex.Unlock()
 			return fmt.Errorf("found multiple Discord servers with the same name %#v, expected to see only one", serverName)
 		}
 
 		// Getting this guild's channel could result in a permission error
 		b.channels, err = b.c.GuildChannels(guild.ID)
 		if err != nil {
+			b.channelsMutex.Unlock()
 			return fmt.Errorf("could not get %#v's channels: %w", b.GetString("Server"), err)
 		}
-		fmt.Println(b.channels)
 		b.guildID = guild.ID
 	}
 	b.channelsMutex.Unlock()
@@ -203,24 +246,20 @@ func (b *Bdiscord) Connect() error {
 		}
 	}
 
-	// Obtaining guild members and initializing nickname mapping.
-	b.membersMutex.Lock()
-	defer b.membersMutex.Unlock()
-	members, err := b.c.GuildMembers(b.guildID, "", 1000)
+	// Obtaining guild members and initializing nickname mapping. The first
+	// page is loaded now, the rest in the background so large servers do not
+	// delay (re)connecting.
+	b.Log.Info("Loading server members")
+	after, more, err := b.loadMemberPage("")
 	if err != nil {
 		b.Log.Error("Error obtaining server members: ", err)
 		return err
 	}
-	for _, member := range members {
-		if member == nil {
-			b.Log.Warnf("Skipping missing information for a user.")
-			continue
-		}
-		b.userMemberMap[member.User.ID] = member
-		b.nickMemberMap[member.User.Username] = member
-		if member.Nick != "" {
-			b.nickMemberMap[member.Nick] = member
-		}
+	if more {
+		b.Log.Info("Loading the remaining server members in the background")
+		go b.loadRemainingMembers(b.c, after)
+	} else {
+		b.Log.Infof("Loaded %d server members", b.memberCount())
 	}
 
 	b.c.AddHandler(b.messageCreate)
@@ -239,7 +278,36 @@ func (b *Bdiscord) Connect() error {
 }
 
 func (b *Bdiscord) Disconnect() error {
+	b.connectMutex.Lock()
+	defer b.connectMutex.Unlock()
+
+	b.setActiveSession(nil)
+	if b.c == nil {
+		return nil
+	}
 	return b.c.Close()
+}
+
+func (b *Bdiscord) setActiveSession(s *discordgo.Session) {
+	b.sessionMutex.Lock()
+	b.activeSession = s
+	b.sessionMutex.Unlock()
+}
+
+// onDisconnect asks the gateway to reconnect this bridge when the active
+// session loses its gateway connection. Disconnects of sessions we closed
+// ourselves are ignored.
+func (b *Bdiscord) onDisconnect(s *discordgo.Session, _ *discordgo.Disconnect) {
+	b.sessionMutex.Lock()
+	if b.activeSession != s {
+		b.sessionMutex.Unlock()
+		return
+	}
+	b.activeSession = nil
+	b.sessionMutex.Unlock()
+
+	b.Log.Warn("Lost connection to the Discord gateway, requesting reconnect")
+	b.Remote <- config.Message{Username: "system", Text: "reconnect", Account: b.Account, Event: config.EventFailure}
 }
 
 func (b *Bdiscord) JoinChannel(channel config.ChannelInfo) error {
@@ -284,7 +352,7 @@ func (b *Bdiscord) Send(msg config.Message) (string, error) {
 	if msg.Event == config.EventMsgDelete || msg.Event == config.EventFileDelete {
 		return b.handleEventBotUser(&msg, channelID)
 	}
-	b.Log.Infof("Sending the discord message via thandle event webhook using " + msg.ParentID)
+	b.Log.Debugf("Sending message to thread %s via webhook", msg.ParentID)
 	return b.handleEventWebhook(&msg, channelID, msg.ParentID)
 }
 

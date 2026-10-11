@@ -20,6 +20,8 @@ type Router struct {
 	Message          chan config.Message
 	MattermostPlugin chan config.Message
 
+	store *msgStore
+
 	logger *logrus.Entry
 }
 
@@ -36,6 +38,7 @@ func NewRouter(rootLogger *logrus.Logger, cfg config.Config, bridgeMap map[strin
 		Gateways:         make(map[string]*Gateway),
 		logger:           logger,
 	}
+	r.openMsgStore()
 	sgw := samechannel.New(cfg)
 	gwconfigs := append(sgw.GetConfig(), cfg.BridgeValues().Gateway...)
 
@@ -52,7 +55,34 @@ func NewRouter(rootLogger *logrus.Logger, cfg config.Config, bridgeMap map[strin
 		}
 		r.Gateways[entry.Name] = New(rootLogger, entry, r)
 	}
+	r.importLegacyCache()
 	return r, nil
+}
+
+// openMsgStore opens the persistent message store. Failure is logged and the
+// router runs with the in-memory cache only.
+func (r *Router) openMsgStore() {
+	general := r.BridgeValues().General
+	path := general.MessageStore
+	if path == "" {
+		path = defaultMessageStorePath
+	}
+	if path == "-" {
+		r.logger.Info("Persistent message store disabled")
+		return
+	}
+	store, err := openMsgStore(path, r.logger)
+	if err != nil {
+		r.logger.Errorf("Opening message store %s failed, threads and edits will not survive a restart: %s", path, err)
+		return
+	}
+	days := general.MessageStoreRetentionDays
+	if days <= 0 {
+		days = defaultMessageStoreRetentionDays
+	}
+	r.logger.Infof("Using message store %s (retention %d days)", path, days)
+	r.store = store
+	go store.pruneLoop(time.Duration(days) * 24 * time.Hour)
 }
 
 // Start will connect all gateways belonging to this router and subsequently route messages
@@ -63,7 +93,7 @@ func (r *Router) Start() error {
 		return fmt.Errorf("no [[gateway]] configured. See https://github.com/mspgeek-community/matterbridge/wiki/How-to-create-your-config for more info")
 	}
 	for _, gw := range r.Gateways {
-		r.logger.Infof("Parsing gateway %s", gw.Name)
+		r.logger.Debugf("Parsing gateway %s", gw.Name)
 		if len(gw.Bridges) == 0 {
 			return fmt.Errorf("no bridges configured for gateway %s. See https://github.com/mspgeek-community/matterbridge/wiki/How-to-create-your-config for more info", gw.Name)
 		}
@@ -71,6 +101,7 @@ func (r *Router) Start() error {
 			m[br.Account] = br
 		}
 	}
+	r.logger.Infof("Loaded %d gateways using %d bridges", len(r.Gateways), len(m))
 	for _, br := range m {
 		r.logger.Infof("Starting bridge: %s ", br.Account)
 		err := br.Connect()
@@ -81,6 +112,7 @@ func (r *Router) Start() error {
 			}
 			return e
 		}
+		r.logger.Infof("Bridge %s connected, joining %d channels", br.Account, len(br.Channels))
 		err = br.JoinChannels()
 		if err != nil {
 			e := fmt.Errorf("Bridge %s failed to join channel: %v", br.Account, err)
@@ -89,6 +121,7 @@ func (r *Router) Start() error {
 			}
 			return e
 		}
+		r.logger.Infof("Bridge %s started", br.Account)
 	}
 	// remove unused bridges
 	for _, gw := range r.Gateways {
@@ -134,8 +167,15 @@ func (r *Router) handleReceive() {
 		r.handleEventFailure(&msg)
 		r.handleEventRejoinChannels(&msg)
 
-		// Set message protocol based on the account it came from
-		msg.Protocol = r.getBridge(msg.Account).Protocol
+		// Set message protocol based on the account it came from. A bridge
+		// removed after failing to start may still have running goroutines
+		// sending messages; drop those.
+		srcBridge := r.getBridge(msg.Account)
+		if srcBridge == nil {
+			r.logger.Debugf("Dropping message from removed bridge %s", msg.Account)
+			continue
+		}
+		msg.Protocol = srcBridge.Protocol
 
 		filesHandled := false
 		for _, gw := range r.Gateways {
@@ -154,16 +194,14 @@ func (r *Router) handleReceive() {
 				msgIDs = append(msgIDs, gw.handleMessage(&msg, br)...)
 			}
 
-			if msg.ID != "" {
-				_, exists := gw.Messages.Get(msg.Protocol + " " + msg.ID)
-
+			// Only gateways that relayed the message record it: recording it in
+			// every gateway filled each gateway's cache with other channels'
+			// messages and evicted the mappings threads and edits need.
+			if msg.ID != "" && len(msgIDs) > 0 {
+				key := msg.Protocol + " " + msg.ID
 				// Only add the message ID if it doesn't already exist
-				//
-				// For some bridges we always add/update the message ID.
-				// This is necessary as msgIDs will change if a bridge returns
-				// a different ID in response to edits.
-				if !exists {
-					gw.Messages.Add(msg.Protocol+" "+msg.ID, msgIDs)
+				if _, exists := gw.lookupIDs(key); !exists {
+					gw.rememberIDs(key, msgIDs)
 				}
 			}
 		}

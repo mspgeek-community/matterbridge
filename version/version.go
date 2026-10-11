@@ -1,6 +1,6 @@
 package version
 
 var (
-	Release = "1.26.1-dev"
+	Release = "1.27.0-mspgeek"
 	GitHash string
 )

@@ -4,6 +4,7 @@
 package bwhatsapp
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -23,11 +24,11 @@ type ProfilePicInfo struct {
 }
 
 func (b *Bwhatsapp) reloadContacts() {
-	if _, err := b.wc.Store.Contacts.GetAllContacts(); err != nil {
+	if _, err := b.wc.Store.Contacts.GetAllContacts(context.TODO()); err != nil {
 		b.Log.Errorf("error on update of contacts: %v", err)
 	}
 
-	allcontacts, err := b.wc.Store.Contacts.GetAllContacts()
+	allcontacts, err := b.wc.Store.Contacts.GetAllContacts(context.TODO())
 	if err != nil {
 		b.Log.Errorf("error on update of contacts: %v", err)
 	}
@@ -117,7 +118,7 @@ func (b *Bwhatsapp) getSenderNotify(senderJid types.JID) string {
 func (b *Bwhatsapp) GetProfilePicThumb(jid string) (*types.ProfilePictureInfo, error) {
 	pjid, _ := types.ParseJID(jid)
 
-	info, err := b.wc.GetProfilePictureInfo(pjid, &whatsmeow.GetProfilePictureParams{
+	info, err := b.wc.GetProfilePictureInfo(context.TODO(), pjid, &whatsmeow.GetProfilePictureParams{
 		Preview: true,
 	})
 	if err != nil {
@@ -136,12 +137,12 @@ func isGroupJid(identifier string) bool {
 func (b *Bwhatsapp) getDevice() (*store.Device, error) {
 	device := &store.Device{}
 
-	storeContainer, err := sqlstore.New("sqlite", "file:"+b.Config.GetString("sessionfile")+".db?_foreign_keys=on&_pragma=busy_timeout=10000", nil)
+	storeContainer, err := sqlstore.New(context.TODO(), "sqlite", "file:"+b.Config.GetString("sessionfile")+".db?_foreign_keys=on&_pragma=foreign_keys(1)&_pragma=busy_timeout=10000", nil)
 	if err != nil {
 		return device, fmt.Errorf("failed to connect to database: %v", err)
 	}
 
-	device, err = storeContainer.GetFirstDevice()
+	device, err = storeContainer.GetFirstDevice(context.TODO())
 	if err != nil {
 		return device, fmt.Errorf("failed to get device: %v", err)
 	}
@@ -158,7 +159,7 @@ func (b *Bwhatsapp) getNewReplyContext(parentID string) (*proto.ContextInfo, err
 
 	sender := fmt.Sprintf("%s@%s", replyInfo.Sender.User, replyInfo.Sender.Server)
 	ctx := &proto.ContextInfo{
-		StanzaId:      &replyInfo.MessageID,
+		StanzaID:      &replyInfo.MessageID,
 		Participant:   &sender,
 		QuotedMessage: &proto.Message{Conversation: goproto.String("")},
 	}
@@ -192,11 +193,11 @@ func (b *Bwhatsapp) parseMessageID(id string) (*Replyable, error) {
 }
 
 func getParentIdFromCtx(ci *proto.ContextInfo) string {
-	if ci != nil && ci.StanzaId != nil {
+	if ci != nil && ci.StanzaID != nil {
 		senderJid, err := types.ParseJID(*ci.Participant)
 
 		if err == nil {
-			return getMessageIdFormat(senderJid, *ci.StanzaId)
+			return getMessageIdFormat(senderJid, *ci.StanzaID)
 		}
 	}
 

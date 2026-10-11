@@ -11,6 +11,7 @@ dynip
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+coverage.html
 
 # Output of profiler
 *.prof
@@ -21,6 +22,9 @@ dynip
 # IntelliJ config
 .idea
 
+# VS Code config
+.vscode
+
 # log files
 *.log
 
@@ -30,8 +34,14 @@ output
 build
 app
 logs
+test-reports
 
 # test apps
 test/cmd/testapp1/testapp1
 test/cmd/simple/simple
 test/cmd/gelf/gelf
+
+# tools
+.aider*
+!.aider.conf.yml
+!.aiderignore

@@ -1,10 +1,12 @@
 package bmattermost
 
 import (
+	"context"
+
+	"github.com/matterbridge/matterclient"
+	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mspgeek-community/matterbridge/bridge/config"
 	"github.com/mspgeek-community/matterbridge/bridge/helper"
-	"github.com/matterbridge/matterclient"
-	"github.com/mattermost/mattermost-server/v6/model"
 )
 
 // handleDownloadAvatar downloads the avatar of userid from channel
@@ -25,7 +27,7 @@ func (b *Bmattermost) handleDownloadAvatar(userid string, channel string) {
 			data []byte
 			err  error
 		)
-		data, _, err = b.mc.Client.GetProfileImage(userid, "")
+		data, _, err = b.mc.Client.GetProfileImage(context.TODO(), userid, "")
 		if err != nil {
 			b.Log.Errorf("ProfileImage download failed for %#v %s", userid, err)
 			return
@@ -43,8 +45,8 @@ func (b *Bmattermost) handleDownloadAvatar(userid string, channel string) {
 
 //nolint:wrapcheck
 func (b *Bmattermost) handleDownloadFile(rmsg *config.Message, id string) error {
-	url, _, _ := b.mc.Client.GetFileLink(id)
-	finfo, _, err := b.mc.Client.GetFileInfo(id)
+	url, _, _ := b.mc.Client.GetFileLink(context.TODO(), id)
+	finfo, _, err := b.mc.Client.GetFileInfo(context.TODO(), id)
 	if err != nil {
 		return err
 	}
@@ -52,7 +54,7 @@ func (b *Bmattermost) handleDownloadFile(rmsg *config.Message, id string) error 
 	if err != nil {
 		return err
 	}
-	data, _, err := b.mc.Client.DownloadFile(id, true)
+	data, _, err := b.mc.Client.DownloadFile(context.TODO(), id, true)
 	if err != nil {
 		return err
 	}
@@ -144,7 +146,7 @@ func (b *Bmattermost) handleMatterClient(messages chan *config.Message) {
 
 		// Use nickname instead of username if defined
 		if !b.GetBool("useusername") {
-			if nick := b.mc.GetNickName(rmsg.UserID); nick != "" {
+			if nick := b.mc.GetNickName(context.TODO(), rmsg.UserID); nick != "" {
 				rmsg.Username = nick
 			}
 		}
@@ -173,7 +175,7 @@ func (b *Bmattermost) handleUploadFile(msg *config.Message) (string, error) {
 	channelID := b.getChannelID(msg.Channel)
 	for _, f := range msg.Extra["file"] {
 		fi := f.(config.FileInfo)
-		id, err = b.mc.UploadFile(*fi.Data, channelID, fi.Name)
+		id, err = b.mc.UploadFile(context.TODO(), *fi.Data, channelID, fi.Name)
 		if err != nil {
 			return "", err
 		}
@@ -181,7 +183,7 @@ func (b *Bmattermost) handleUploadFile(msg *config.Message) (string, error) {
 		if b.GetBool("PrefixMessagesWithNick") {
 			msg.Text = msg.Username + msg.Text
 		}
-		res, err = b.mc.PostMessageWithFiles(channelID, msg.Text, msg.ParentID, []string{id})
+		res, err = b.mc.PostMessageWithFiles(context.TODO(), channelID, msg.Text, msg.ParentID, []string{id})
 	}
 	return res, err
 }
